@@ -1,0 +1,19 @@
+.pyseekdb_test_ob_uri
+.pyseekdb_test_ray_address
+# project
+poetry.lock
+tests/.env
+__pycache__/
+build/
+
+# demo
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+demo/rag/data/
+geneva_demo_db/
+geneva-0.7.0/
