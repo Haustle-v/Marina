@@ -3,15 +3,24 @@
 PySeekDB database client module.
 Provides compatibility with lancedb APIs while using PySeekDB's underlying implementation.
 """
+import inspect
 import logging
-from typing import Optional, Union, List, Any, Dict, Literal, Iterable
+import socket
+import tempfile
+import threading
+from typing import Optional, Union, List, Any, Dict, Literal, Iterable, Tuple
 import pyarrow as pa
 from overrides import override
 import numpy as np
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import json
 import uuid
 import time
+import cloudpickle
+import shutil
 
 from . import Client, AdminClient, HNSWConfiguration
 from .collection import Collection
@@ -114,6 +123,43 @@ def _arrow_type_to_sql_type(field: pa.Field) -> str:
         return "JSON"
     # Fallback
     return "TEXT"
+
+
+def _start_temp_http_server(directory: Path) -> Tuple[ThreadingHTTPServer, str]:
+    """
+    Start a lightweight HTTP server to host files under the provided directory.
+    Returns the server instance and base url.
+    """
+    handler = partial(SimpleHTTPRequestHandler, directory=str(directory))
+    httpd = ThreadingHTTPServer(("0.0.0.0", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        host = "127.0.0.1"
+    base_url = f"http://{host}:{httpd.server_port}"
+    return httpd, base_url
+
+
+def _write_udf_file_and_serve(udf_func: Any) -> Tuple[str, ThreadingHTTPServer, str]:
+    """
+    Serialize udf_func via cloudpickle into a temporary file, start HTTP server, return (url, server, file_path).
+    """
+    temp_dir = Path(tempfile.mkdtemp(prefix="pyseekdb_udf_"))
+    file_name = f"{udf_func.__name__}.pkl"
+    file_path = temp_dir / file_name
+    try:
+        data = cloudpickle.dumps(udf_func)
+        with open(file_path, "wb") as f:
+            f.write(data)
+    except Exception:
+        pass
+
+    server, base_url = _start_temp_http_server(temp_dir)
+    file_url = f"{base_url}/{file_name}"
+    return file_url, server, str(file_path)
 
 class Connection:
     """PySeekDB Connection compatible with lancedb.DBConnection."""
@@ -463,7 +509,7 @@ class Table:
 
     def add_column(
         self,
-        name: str,
+        col_name: str,
         data_type: Any,
         *,
         expression: Optional[str] = None,
@@ -480,35 +526,57 @@ class Table:
         This is a table-level API similar to geneva-0.7.0's add_columns for UDF columns.
 
         Supported:
-        - Normal columns: `ALTER TABLE ... ADD COLUMN ...`
-        - Generated columns: `GENERATED ALWAYS AS (<expression>) [VIRTUAL|STORED]`
-
-        Not supported (yet):
-        - Associating generated columns with a Python UDF (OceanBase generated columns
-          do not support UDF today). The `udf` parameter is reserved for future use.
+        - Normal columns:           `ALTER TABLE tbl ADD COLUMN col_name sql_type NOT NULL`
+        - Normal Generated columns: `ALTER TABLE tbl ADD COLUMN col_name sql_type GENERATED ALWAYS AS (<expression>) [VIRTUAL|STORED]`
+        - UDF Generated columns:    `ALTER TABLE tbl ADD COLUMN col_name sql_type GENERATED ALWAYS AS (<udf_name>) [VIRTUAL|STORED]`
         """
-        if not name or not isinstance(name, str):
-            raise ValueError("name must be a non-empty string")
+        if not col_name or not isinstance(col_name, str):
+            raise ValueError("col_name must be a non-empty string")
 
-        sql_type = _to_sql_type(data_type)
-        col_def = f"`{name}` {sql_type}"
+        col_def = f"`{col_name}` {_to_sql_type(data_type)}"
+        server: Optional[ThreadingHTTPServer] = None
+        udf_file_path: Optional[Path] = None
+        udf_temp_dir: Optional[Path] = None
 
         if expression is not None:
+            # Normal expression generated columns
             expr = expression.strip()
             if not expr:
                 raise ValueError("expression must be a non-empty string when provided")
             col_def += f" GENERATED ALWAYS AS ({expr})"
             col_def += " STORED" if stored else " VIRTUAL"
+        elif udf is not None:
+            # UDF generated columns
+            if not inspect.isfunction(udf):
+                raise ValueError("udf must be a Python function")
 
-            # TODO: OceanBase generated columns do not support UDF today.
-            # Keep this parameter for future extension (e.g. encode udf metadata
-            # or translate to server-side UDF when supported).
-            if udf is not None:
-                _LOG.warning(
-                    "add_column udf binding is not supported yet; ignoring udf=%r",
-                    udf,
-                )
+            # file_url: the url of the udf file uploaded to the server
+            # file_path: the path of the temporary udf file
+            file_url, server, file_path = _write_udf_file_and_serve(udf)
+            udf_file_path = Path(file_path)
+            udf_temp_dir = udf_file_path.parent
+            udf_name = udf.__name__
+
+            # udf_name is the only identifier for the udf function
+            create_udf_func_sql = (
+                f"CREATE FUNCTION {udf_name}(arg1 INT) "
+                "RETURNS INT "
+                "PROPERTIES ("
+                f"symbol = {_sql_quote_string(udf_name)}, "
+                "type = 'Python', "
+                f"file = {_sql_quote_string(file_url)}, "
+                "mode = 'remote'"
+                ");"
+            )
+            _LOG.info("Creating UDF with SQL: %s; source file: %s", create_udf_func_sql, file_path)
+            # execute the sql to create the udf function
+            self._conn._client_proxy._server._execute(create_udf_func_sql)
+
+            col_def += f" GENERATED ALWAYS AS ({udf_name})"
+            col_def += " STORED" if stored else " VIRTUAL"
+
         else:
+            # Normal columns
             col_def += " NULL" if nullable else " NOT NULL"
             if default is not None:
                 col_def += f" DEFAULT {_sql_literal(default)}"
@@ -520,10 +588,29 @@ class Table:
         _LOG.info("Adding column with SQL: %s", sql)
         self._conn._client_proxy._server._execute(sql)
 
+        # Cleanup temp UDF server and files
+        if server is not None:
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:
+                pass
+        if udf_file_path is not None:
+            try:
+                udf_file_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if udf_temp_dir is not None:
+            try:
+                if not any(udf_temp_dir.iterdir()):
+                    udf_temp_dir.rmdir()
+            except Exception:
+                pass
+
         # Best-effort schema cache update
         try:
             if self._schema is not None:
-                arrow_field = _to_arrow_field(name, data_type, nullable=nullable)
+                arrow_field = _to_arrow_field(col_name, data_type, nullable=nullable)
                 self._schema = self._schema.append(arrow_field)
         except Exception:
             # Schema cache is optional; ignore failures
