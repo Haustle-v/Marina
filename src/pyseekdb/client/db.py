@@ -513,11 +513,12 @@ class Table:
         data_type: Any,
         *,
         expression: Optional[str] = None,
-        stored: bool = False,
+        stored: bool = True,
         nullable: bool = True,
         default: Any = None,
         comment: Optional[str] = None,
         udf: Any = None,
+        udf_name: Optional[str] = None, 
         input_columns: Optional[List[str]] = None,
     ) -> None:
         """
@@ -555,7 +556,13 @@ class Table:
             file_url, server, file_path = _write_udf_file_and_serve(udf)
             udf_file_path = Path(file_path)
             udf_temp_dir = udf_file_path.parent
-            udf_name = udf.__name__
+             # udf_name is the routine_name of the udf routine. It would be set to the name of udf if not explicitly provided.
+            if udf_name is None:
+                udf_name = udf.__name__
+
+            joined_input_columns = ""
+            if input_columns:
+                joined_input_columns = ",".join(input_columns)
 
             # udf_name is the only identifier for the udf function
             create_udf_func_sql = (
@@ -565,15 +572,16 @@ class Table:
                 f"symbol = {_sql_quote_string(udf_name)}, "
                 "type = 'Python', "
                 f"file = {_sql_quote_string(file_url)}, "
-                "mode = 'remote'"
+                "mode = 'remote',"
+                f"input_columns = {_sql_quote_string(joined_input_columns)}"
                 ");"
             )
             _LOG.info("Creating UDF with SQL: %s; source file: %s", create_udf_func_sql, file_path)
             # execute the sql to create the udf function
             self._conn._client_proxy._server._execute(create_udf_func_sql)
 
-            col_def += f" GENERATED ALWAYS AS ({udf_name})"
-            col_def += " STORED" if stored else " VIRTUAL"
+            col_def += f" GENERATED ALWAYS AS (UDF.{udf_name})"
+            col_def += " STORED"                # OB will not allocate physical memory for the VITRUAL generated columns, so only STORED is supported
 
         else:
             # Normal columns
