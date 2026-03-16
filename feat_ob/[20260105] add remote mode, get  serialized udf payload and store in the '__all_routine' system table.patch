@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html class="html-devise-layout gl-light" lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta content="IE=edge" http-equiv="X-UA-Compatible">
+<meta content="width=device-width, initial-scale=1" name="viewport">
+<title>登录 · 极狐GitLab</title>
+<script>
+//<![CDATA[
+window.gon={};
+//]]>
+</script>
+
+
+
+
+
+
+<link rel="stylesheet" href="/assets/application-123c95f81c395df63bfa7cd7b8749456ec5c8d04d4a0158f68d9d1444b5c0046.css" />
+<link rel="stylesheet" href="/assets/page_bundles/signin-78d9f4c1b5d69fdea65e937acc9088a53917fefe45b903cf807f660adb4cd26d.css" /><link rel="stylesheet" href="/assets/page_bundles/login-5f5d2f7e38183f1a4ada972b287f9703f862e503f3134c8ede2ebe2964b2a78a.css" /><link rel="stylesheet" href="/assets/page_bundles/commit_description-1e2cba4dda3c7b30dd84924809020c569f1308dea51520fe1dd5d4ce31403195.css" /><link rel="stylesheet" href="/assets/page_bundles/work_items-0bab65ad25644020e75fa90592713316a101e5859001cf80e99afce8d173eba4.css" /><link rel="stylesheet" href="/assets/page_bundles/notes_shared-3bb84b0aaad44aa5af4a1dd05713ec998273465ef28436cc7d1d1b97602c6bff.css" />
+<link rel="stylesheet" href="/assets/application_utilities-f77f86f78d4146d4c2c821bc481cee77b897df284886ad189d8dcb1234cb9651.css" />
+<link rel="stylesheet" href="/assets/tailwind-cd4c3dfba5b38939f9374ba06f95026c95c69fcb2cb06ae40202653d2eec5b8a.css" />
+
+
+<link rel="stylesheet" href="/assets/fonts-fae5d3f79948bd85f18b6513a025f863b19636e85b09a1492907eb4b1bb0557b.css" />
+<link rel="stylesheet" href="/assets/highlight/themes/white-99cce4f4b362f6840d7134d4129668929fde49c4da11d6ebf17f99768adbd868.css" />
+
+
+<link rel="preload" href="/assets/application_utilities-f77f86f78d4146d4c2c821bc481cee77b897df284886ad189d8dcb1234cb9651.css" as="style" type="text/css">
+<link rel="preload" href="/assets/application-123c95f81c395df63bfa7cd7b8749456ec5c8d04d4a0158f68d9d1444b5c0046.css" as="style" type="text/css">
+<link rel="preload" href="/assets/highlight/themes/white-99cce4f4b362f6840d7134d4129668929fde49c4da11d6ebf17f99768adbd868.css" as="style" type="text/css">
+
+<script src="/assets/locale/zh_CN/app-5cf95feaac94c4edad1df7fe5175aaf441612c710931bebcfc8a31ff4ca2d2f7.js" defer="defer"></script>
+
+
+<script src="/assets/webpack/runtime.f4f1abdf.bundle.js" defer="defer"></script>
+<script src="/assets/webpack/main.dccdc441.chunk.js" defer="defer"></script>
+<script src="/assets/webpack/commons-pages.search.show-super_sidebar.94077dfd.chunk.js" defer="defer"></script>
+<script src="/assets/webpack/super_sidebar.1bdce8f5.chunk.js" defer="defer"></script>
+<script src="/assets/webpack/pages.sessions.new.40a3d1be.chunk.js" defer="defer"></script>
+
+
+
+
+<meta name="csrf-param" content="authenticity_token" />
+<meta name="csrf-token" content="1rstHuu4ekjWjglVlVQlilvQY_cJ1FQVUcmYdACTgx38zNUnHIXTNmlXbRiP9-qGLheoFhkrWOOpqlzqemDx3w" />
+<meta name="csp-nonce" />
+<meta name="action-cable-url" content="/-/cable" />
+<link href="/-/manifest.json" rel="manifest">
+<link rel="icon" type="image/png" href="/assets/favicon-72a2cad5025aa931d6ea56c3201d1f18e68a8cd39788c7c80d5b2b82aa5143ef.png" id="favicon" data-original-href="/assets/favicon-72a2cad5025aa931d6ea56c3201d1f18e68a8cd39788c7c80d5b2b82aa5143ef.png" />
+<link rel="apple-touch-icon" type="image/x-icon" href="/assets/apple-touch-icon-b049d4bc0dd9626f31db825d61880737befc7835982586d015bded10b4435460.png" />
+<link href="/search/opensearch.xml" rel="search" title="Search GitLab" type="application/opensearchdescription+xml">
+
+
+
+<!-- Tencent RUM -->
+<!-- End Tencent Code -->
+
+<meta content="👏🏻 欢迎使用 GitLab 👏🏻" name="description">
+<meta content="#ececef" name="theme-color">
+</head>
+
+<body class="gl-h-full login-page navless gl-browser-generic gl-platform-other" data-page="sessions:new" data-qa-selector="login_page" data-testid="login-page">
+<div class="jh-language-switcher position-fixed gl-flex gl-items-center gl-top-0 gl-right-0 gl-flex-row-reverse pr-3" style="height: 40px; z-index: 250;">
+<div class="js-language-switcher" data-locales="[{&quot;value&quot;:&quot;en&quot;,&quot;percentage&quot;:100,&quot;text&quot;:&quot;English&quot;},{&quot;value&quot;:&quot;ko&quot;,&quot;percentage&quot;:99,&quot;text&quot;:&quot;한국어&quot;},{&quot;value&quot;:&quot;fr&quot;,&quot;percentage&quot;:98,&quot;text&quot;:&quot;français&quot;},{&quot;value&quot;:&quot;de&quot;,&quot;percentage&quot;:95,&quot;text&quot;:&quot;Deutsch&quot;},{&quot;value&quot;:&quot;ja&quot;,&quot;percentage&quot;:94,&quot;text&quot;:&quot;日本語&quot;},{&quot;value&quot;:&quot;zh_CN&quot;,&quot;percentage&quot;:93,&quot;text&quot;:&quot;简体中文&quot;},{&quot;value&quot;:&quot;pt_BR&quot;,&quot;percentage&quot;:92,&quot;text&quot;:&quot;português (Brasil)&quot;}]"></div>
+
+</div>
+
+<script>
+//<![CDATA[
+gl = window.gl || {};
+gl.client = {"isGeneric":true,"isOther":true};
+
+
+//]]>
+</script>
+
+
+
+
+<div class="gl-h-full borderless gl-flex gl-flex-wrap">
+<div class="container">
+<div class="content">
+<div class="flash-container flash-container-page sticky" data-testid="flash-container">
+<div class="gl-alert flash-alert gl-alert-danger" data-testid="alert-danger" role="alert">
+<div class="gl-alert-icon-container">
+<svg class="s16 gl-alert-icon gl-alert-icon-no-title" data-testid="error-icon"><use href="/assets/icons-aa2c8ddf99d22b77153ca2bb092a23889c12c597fc8b8de94b0f730eb53513f6.svg#error"></use></svg>
+</div>
+<button class="gl-button btn btn-icon btn-sm btn-default btn-default-tertiary js-close gl-dismiss-btn " aria-label="忽略" type="button"><svg class="s16 gl-icon gl-button-icon " data-testid="close-icon"><use href="/assets/icons-aa2c8ddf99d22b77153ca2bb092a23889c12c597fc8b8de94b0f730eb53513f6.svg#close"></use></svg>
+
+</button>
+<div class="gl-alert-content" role="alert">
+<div class="gl-alert-body">
+您需要先登录或注册，然后才能继续。
+
+</div>
+</div>
+</div>
+<div id="js-global-alerts"></div>
+</div>
+
+<div class="mt-3">
+<div class="col-sm-12 gl-text-center">
+<img alt="👏🏻 欢迎使用 GitLab 👏🏻" class="gl-invisible gl-h-10 js-portrait-logo-detection lazy" data-src="/uploads/-/system/appearance/logo/1/logox1.png" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" />
+<h1 class="mb-3 gl-text-size-h2">
+👏🏻 欢迎使用 GitLab 👏🏻
+</h1>
+<p data-sourcepos="1:1-1:91" dir="auto">点击ant idp自动登录，如果您是新用户的话，请联系 世鸣 or 横塘 处理</p>
+
+</div>
+</div>
+<div class="mb-3">
+<div class="gl-xs-w-full gl-ml-auto gl-mr-auto bar sm:gl-w-1/2">
+
+<div class="js-non-oauth-login">
+</div>
+<p class="gl-mt-3">
+登录即表示您接受<a href='/-/users/terms' target='_blank' rel='noreferrer noopener'>使用条款并接受隐私政策和 Cookie 政策</a>。
+</p>
+<div class="clearfix">
+<div class="js-oauth-login gl-mt-5 gl-flex gl-flex-col gl-gap-3 gl-text-center gl-ml-auto gl-mr-auto">
+<form class="js-omniauth-form" method="post" action="/users/auth/saml"><button class="gl-button btn btn-block btn-md btn-default " data-testid="saml-login-button" type="submit"><span class="gl-button-text">
+<span class="gl-button-text">
+ant idp
+</span>
+
+</span>
+
+</button><input type="hidden" name="authenticity_token" value="U5gwWNCmW4sGtLcNVVjnxIyzF2-9s4NeIAuahNYI4Xl578hhJ5vy9blt00BP-yjI-XTcjq1Mj6jYaF4arPuTuw" autocomplete="off" /></form>
+<div class="gl-form-checkbox custom-control custom-checkbox">
+<input type="checkbox" name="js-remember-me-omniauth" id="js-remember-me-omniauth" class="custom-control-input" />
+<label class="custom-control-label" for="js-remember-me-omniauth"><span>记住账号
+</span></label>
+</div>
+</div>
+
+</div>
+
+</div>
+</div>
+</div>
+</div>
+<div class="footer-container gl-w-full gl-self-end">
+<hr class="gl-m-0">
+<div class="container gl-py-5 gl-flex gl-justify-between">
+<div class="gl-flex gl-gap-5 gl-flex-wrap gl-w-full">
+<a href="/explore">探索</a>
+<a href="/help">帮助</a>
+<a href="https://about.gitlab.cn">极狐(GitLab)官网</a>
+</div>
+<div class="js-language-switcher" data-locales="[{&quot;value&quot;:&quot;en&quot;,&quot;percentage&quot;:100,&quot;text&quot;:&quot;English&quot;},{&quot;value&quot;:&quot;ko&quot;,&quot;percentage&quot;:99,&quot;text&quot;:&quot;한국어&quot;},{&quot;value&quot;:&quot;fr&quot;,&quot;percentage&quot;:98,&quot;text&quot;:&quot;français&quot;},{&quot;value&quot;:&quot;de&quot;,&quot;percentage&quot;:95,&quot;text&quot;:&quot;Deutsch&quot;},{&quot;value&quot;:&quot;ja&quot;,&quot;percentage&quot;:94,&quot;text&quot;:&quot;日本語&quot;},{&quot;value&quot;:&quot;zh_CN&quot;,&quot;percentage&quot;:93,&quot;text&quot;:&quot;简体中文&quot;},{&quot;value&quot;:&quot;pt_BR&quot;,&quot;percentage&quot;:92,&quot;text&quot;:&quot;português (Brasil)&quot;}]"></div>
+
+</div>
+</div>
+
+
+</div>
+</body>
+</html>
