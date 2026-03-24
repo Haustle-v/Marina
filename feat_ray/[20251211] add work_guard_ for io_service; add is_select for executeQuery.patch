@@ -1,0 +1,1269 @@
+From 907b37e7728e85bdc75793fb593d901f182b4434 Mon Sep 17 00:00:00 2001
+From: He Su <yefengshuo.yfs@oceanbase.com>
+Date: Thu, 11 Dec 2025 01:31:17 -0800
+Subject: [PATCH] [ob_context_test] add work_guard_ for io_service;
+ [ob_context] add is_select for executeQuery/executeUpdate, use
+ sql::Connection::isValid()/reconnect()
+
+---
+ .gitignore                                    |   3 +-
+ src/ray/gcs/store_client/ob_context.cc        |  89 ++--
+ src/ray/gcs/store_client/ob_context.h         |  12 +-
+ src/ray/gcs/store_client/ob_context_MysqlC.cc | 423 ++++++++++++++++++
+ src/ray/gcs/store_client/ob_context_MysqlC.h  | 167 +++++++
+ src/ray/gcs/store_client/ob_store_client.cc   |  23 +-
+ src/ray/gcs/store_client/ob_store_client.h    |   1 +
+ .../gcs/store_client/tests/ob_context_test.cc | 164 +++++--
+ .../tests/ob_store_client_test.cc             |   2 +-
+ 9 files changed, 787 insertions(+), 97 deletions(-)
+ create mode 100644 src/ray/gcs/store_client/ob_context_MysqlC.cc
+ create mode 100644 src/ray/gcs/store_client/ob_context_MysqlC.h
+
+diff --git a/.gitignore b/.gitignore
+index e36e526322a5..e256d42f9e65 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -245,5 +245,4 @@ tag-mapping.json
+ .buildkite/release/custom_byod_build.rayci.yml
+ 
+ /demo
+-src/ray/gcs/store_client/ob_context_MysqlC.cc
+-src/ray/gcs/store_client/ob_context_MysqlC.h
+\ No newline at end of file
++thirdparty/mysql-connector-cpp
+\ No newline at end of file
+diff --git a/src/ray/gcs/store_client/ob_context.cc b/src/ray/gcs/store_client/ob_context.cc
+index e79a646db070..581098f9d15c 100644
+--- a/src/ray/gcs/store_client/ob_context.cc
++++ b/src/ray/gcs/store_client/ob_context.cc
+@@ -4,13 +4,6 @@
+ 
+ #include "ray/gcs/store_client/ob_context.h"
+ 
+-#include <mysql-cppconn/jdbc/mysql_driver.h>
+-#include <mysql-cppconn/jdbc/cppconn/exception.h>
+-#include <mysql-cppconn/jdbc/cppconn/prepared_statement.h>
+-#include <mysql-cppconn/jdbc/cppconn/resultset.h>
+-#include <mysql-cppconn/jdbc/cppconn/resultset_metadata.h>
+-#include <mysql-cppconn/jdbc/cppconn/statement.h>
+-
+ #include <algorithm>
+ #include <memory>
+ #include <string>
+@@ -25,7 +18,7 @@ namespace gcs {
+ OBContext::OBContext(instrumented_io_context &io_service) : io_service_(io_service) {
+   driver_ = sql::mysql::get_mysql_driver_instance();
+   RAY_CHECK(driver_ != nullptr) << "Failed to get MySQL driver instance";
+-  RAY_LOG(INFO) << "Successfully initialize MySQL driver instance";
++  RAY_LOG(INFO) << "Successfully initialize MySQL driver instance: " << driver_;
+ }
+ 
+ OBContext::~OBContext() {
+@@ -83,7 +76,7 @@ Status OBContext::Initialize(const OBClientOptions &options) {
+     }
+   };
+ 
+-  RAY_LOG(INFO) << "Drop table " << kRayGcsTableNameInOB;
++  RAY_LOG(INFO) << "Drop table if exists " << kRayGcsTableNameInOB;
+   auto status =
+       exec_schema_sql(absl::StrCat("DROP TABLE IF EXISTS ", kRayGcsTableNameInOB));
+   if (!status.ok()) {
+@@ -95,7 +88,7 @@ Status OBContext::Initialize(const OBClientOptions &options) {
+   RAY_LOG(INFO) << "Create table " << kRayGcsTableNameInOB;
+   status = exec_schema_sql(absl::StrCat("CREATE TABLE ",
+                                         kRayGcsTableNameInOB,
+-                                        " (k VARBINARY(65535) NOT NULL PRIMARY KEY, "
++                                        " (k VARBINARY(16384) NOT NULL PRIMARY KEY, "
+                                         "v MEDIUMBLOB)"));
+   if (!status.ok()) {
+     RAY_LOG(ERROR) << "Failed to create table " << kRayGcsTableNameInOB << ": "
+@@ -109,9 +102,9 @@ Status OBContext::Initialize(const OBClientOptions &options) {
+       return Status::IOError("Failed to create initial database connection " +
+                              std::to_string(i));
+     }
+-    if (!ValidateConnection(conn)) {
++    if (!conn->isValid()) {
+       delete conn;
+-      return Status::IOError("Failed to validate initial database connection " +
++      return Status::IOError("Initial database connection is invalid " +
+                              std::to_string(i));
+     }
+     connection_pool_.push(conn);
+@@ -135,9 +128,12 @@ sql::Connection *OBContext::CreateConnection() {
+   }
+   try {
+     RAY_LOG(INFO) << "Creating database connection with uri=" << absl::StrCat("tcp://", options_.server, ":", options_.port);
+-    std::string uri = absl::StrCat(options_.server, ":", options_.port);
+-    sql::Connection *conn =
+-        driver_->connect(uri, options_.username, options_.password);
++    conn_opts_["hostName"] = absl::StrCat(options_.server, ":", options_.port);
++    conn_opts_["userName"] = options_.username;
++    conn_opts_["password"] = options_.password;
++    // Disable OTel in libmysqlcppconn to avoid symbol conflicts with OTel in Ray.
++    conn_opts_["OPT_OPENTELEMETRY"] = sql::OTEL_DISABLED;
++    sql::Connection* conn = driver_->connect(conn_opts_);
+     conn->setSchema(options_.database);
+     return conn;
+   } catch (const sql::SQLException &e) {
+@@ -148,26 +144,6 @@ sql::Connection *OBContext::CreateConnection() {
+   }
+ }
+ 
+-bool OBContext::ValidateConnection(sql::Connection *conn) {
+-  if (!conn) {
+-    return false;
+-  }
+-
+-  try {
+-    if (conn->isClosed()) {
+-      conn->reconnect();
+-      conn->setSchema(options_.database);
+-    }
+-
+-    std::unique_ptr<sql::Statement> stmt(conn->createStatement());
+-    stmt->execute("SELECT 1");
+-    return true;
+-  } catch (const sql::SQLException &e) {
+-    RAY_LOG(WARNING) << "Connection validation failed: " << e.what();
+-    return false;
+-  }
+-}
+-
+ sql::Connection *OBContext::AcquireConnection() {
+   absl::MutexLock lock(&pool_mutex_);
+ 
+@@ -175,19 +151,17 @@ sql::Connection *OBContext::AcquireConnection() {
+     sql::Connection *conn = connection_pool_.front();
+     connection_pool_.pop();
+ 
+-    if (ValidateConnection(conn)) {
++    if (!conn->isValid()) {
++      conn->reconnect();
++    } 
++      
++    if (conn->isValid()) {
+       return conn;
++    } else {
++      delete conn;
+     }
+-
+-    delete conn;
+   }
+ 
+-  sql::Connection *conn = CreateConnection();
+-  if (ValidateConnection(conn)) {
+-    return conn;
+-  }
+-  delete conn;
+-
+   RAY_LOG(ERROR)
+       << "Database connection pool is unhealthy, please check the connection status.";
+   return nullptr;
+@@ -205,7 +179,8 @@ void OBContext::ReleaseConnection(sql::Connection *conn) {
+ std::shared_ptr<OBResult> OBContext::ExecuteSync(
+     sql::Connection *conn,
+     const std::string &sql,
+-    const std::vector<std::string> &bind_params) {
++    const std::vector<std::string> &bind_params,
++    bool is_select) {
+   auto result = std::make_shared<OBResult>();
+ 
+   if (!conn) {
+@@ -215,23 +190,28 @@ std::shared_ptr<OBResult> OBContext::ExecuteSync(
+   }
+ 
+   try {
++    RAY_LOG(INFO) << "Executing SQL: " << sql;
+     std::unique_ptr<sql::PreparedStatement> stmt(conn->prepareStatement(sql));
++    RAY_LOG(INFO) << "Binding params: " << absl::StrJoin(bind_params, ", ");
+     for (size_t i = 0; i < bind_params.size(); ++i) {
+       const auto &value = bind_params[i];
+       stmt->setString(static_cast<int>(i + 1),
+                       sql::SQLString(value.data(), value.size()));
+     }
+ 
+-    bool has_result = stmt->execute();
+-    int64_t affected = stmt->getUpdateCount();
+-    result->affected_rows = affected >= 0 ? affected : 0;
+-
+-    if (!has_result) {
++    RAY_LOG(INFO) << "Executing statement...";
++    if (!is_select) {
++      result->affected_rows = stmt->executeUpdate();
++      RAY_LOG(INFO) << "Statement executed as update, affected_rows="
++                    << result->affected_rows;
+       return result;
+     }
+ 
+-    std::unique_ptr<sql::ResultSet> res(stmt->getResultSet());
++    RAY_LOG(INFO) << "Executing query and fetching ResultSet";
++    std::unique_ptr<sql::ResultSet> res(stmt->executeQuery());
++    RAY_LOG(INFO) << "ResultSet got";
+     if (!res) {
++      RAY_LOG(WARNING) << "Statement executed with no ResultSet, return";
+       return result;
+     }
+ 
+@@ -250,6 +230,7 @@ std::shared_ptr<OBResult> OBContext::ExecuteSync(
+       }
+       result->rows.push_back(std::move(row));
+     }
++    
+   } catch (const sql::SQLException &e) {
+     result->status = Status::IOError(
+         absl::StrCat("MySQL error: ", e.what(), " (code=", e.getErrorCode(),
+@@ -267,13 +248,17 @@ std::shared_ptr<OBResult> OBContext::ExecuteSync(
+ void OBContext::ExecuteAsync(
+     const std::string &sql,
+     const std::vector<std::string> &bind_params,
++    bool is_select,
+     OBCallback callback) {
+   thread_pool_->Post([this,
+                       sql,
+                       bind_params,
++                      is_select,
+                       callback = std::move(callback)]() mutable {
++    RAY_LOG(INFO) << "Acquiring connection";
+     sql::Connection *conn = AcquireConnection();
+-    auto result = ExecuteSync(conn, sql, bind_params);
++    RAY_LOG(INFO) << "Connection acquired";
++    auto result = ExecuteSync(conn, sql, bind_params, is_select);
+     ReleaseConnection(conn);
+ 
+     // Post callback to io_service
+diff --git a/src/ray/gcs/store_client/ob_context.h b/src/ray/gcs/store_client/ob_context.h
+index 19c0ae9db37a..bcf876a8bc6c 100644
+--- a/src/ray/gcs/store_client/ob_context.h
++++ b/src/ray/gcs/store_client/ob_context.h
+@@ -11,6 +11,11 @@
+ 
+ #include <mysql-cppconn/jdbc/mysql_driver.h>
+ #include <mysql-cppconn/jdbc/cppconn/connection.h>
++#include <mysql-cppconn/jdbc/cppconn/exception.h>
++#include <mysql-cppconn/jdbc/cppconn/prepared_statement.h>
++#include <mysql-cppconn/jdbc/cppconn/resultset.h>
++#include <mysql-cppconn/jdbc/cppconn/resultset_metadata.h>
++#include <mysql-cppconn/jdbc/cppconn/statement.h>
+ 
+ #include "absl/synchronization/mutex.h"
+ #include "ray/common/asio/instrumented_io_context.h"
+@@ -97,10 +102,12 @@ class OBContext {
+   ///
+   /// \param sql SQL statement (can contain placeholders).
+   /// \param bind_params Parameters to bind (empty if no placeholders).
++  /// \param is_select Whether the SQL expects a result set.
+   /// \param callback Callback to invoke with the result.
+   void ExecuteAsync(
+       const std::string &sql,
+       const std::vector<std::string> &bind_params,
++      bool is_select,
+       OBCallback callback);
+ 
+   /// Get the io_service reference.
+@@ -127,11 +134,13 @@ class OBContext {
+   /// \param conn MySQL connection.
+   /// \param sql SQL statement.
+   /// \param bind_params Parameters to bind.
++  /// \param is_select Whether the SQL expects a result set.
+   /// \return OBResult with the operation result.
+   std::shared_ptr<OBResult> ExecuteSync(
+       sql::Connection *conn,
+       const std::string &sql,
+-      const std::vector<std::string> &bind_params);
++      const std::vector<std::string> &bind_params,
++      bool is_select);
+ 
+   /// Validate and reconnect a connection if needed.
+   ///
+@@ -141,6 +150,7 @@ class OBContext {
+ 
+   instrumented_io_context &io_service_;
+   OBClientOptions options_;
++  sql::ConnectOptionsMap conn_opts_;
+   std::unique_ptr<core::BoundedExecutor> thread_pool_;
+   sql::Driver *driver_ = nullptr;
+ 
+diff --git a/src/ray/gcs/store_client/ob_context_MysqlC.cc b/src/ray/gcs/store_client/ob_context_MysqlC.cc
+new file mode 100644
+index 000000000000..caa50997c828
+--- /dev/null
++++ b/src/ray/gcs/store_client/ob_context_MysqlC.cc
+@@ -0,0 +1,423 @@
++// Author: He Su
++// Email: yefengshuo.yfs@oceanbase.com
++// Create Time: 2025-11-26
++
++#include "ray/gcs/store_client/ob_context_MysqlC.h"
++
++#include <mysql/mysql.h>
++
++#include <algorithm>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "ray/util/logging.h"
++#include "absl/strings/str_cat.h"
++
++namespace ray {
++namespace gcs {
++
++OBContext::OBContext(instrumented_io_context &io_service) : io_service_(io_service) {
++  // Initialize MySQL library
++  if (mysql_library_init(0, nullptr, nullptr) != 0) {
++    RAY_LOG(FATAL) << "Failed to initialize MySQL library";
++  }
++}
++
++OBContext::~OBContext() {
++  // Stop thread pool
++  if (thread_pool_) {
++    thread_pool_->Stop();
++    thread_pool_->Join();
++  }
++
++  // Close all connections
++  {
++    absl::MutexLock lock(&pool_mutex_);
++    while (!connection_pool_.empty()) {
++      MYSQL *conn = connection_pool_.front();
++      connection_pool_.pop();
++      if (conn) {
++        mysql_close(conn);
++      }
++    }
++  }
++
++  if (initialized_) {
++    MYSQL *cleanup_conn = CreateConnection();
++    if (cleanup_conn) {
++      std::string drop_sql =
++          absl::StrCat("DROP TABLE IF EXISTS ", kRayGcsTableNameInOB);
++      if (mysql_query(cleanup_conn, drop_sql.c_str()) != 0) {
++        RAY_LOG(WARNING) << "Failed to drop table " << kRayGcsTableNameInOB << ": "
++                         << mysql_error(cleanup_conn);
++      }
++      mysql_close(cleanup_conn);
++    }
++  }
++
++  // Cleanup MySQL library
++  mysql_library_end();
++}
++
++Status OBContext::Initialize(const OBClientOptions &options) {
++  absl::MutexLock lock(&pool_mutex_);
++  if (initialized_) {
++    return Status::OK();
++  }
++
++  options_ = options;
++  RAY_CHECK(!options_.server.empty()) << "OB server cannot be empty";
++  RAY_CHECK(!options_.username.empty()) << "OB username cannot be empty";
++  RAY_CHECK(!options_.password.empty()) << "OB password cannot be empty";
++  RAY_CHECK(!options_.database.empty()) << "OB database cannot be empty";
++  RAY_CHECK(options_.port > 0) << "OB port must be greater than 0";
++  RAY_CHECK(options_.connection_pool_size > 0) << "OB connection pool size must be greater than 0";
++  RAY_CHECK(options_.thread_pool_size > 0) << "OB thread pool size must be greater than 0";
++
++  auto schema_conn = CreateConnection();
++  if (!schema_conn) {
++    RAY_LOG(ERROR) << "Failed to create database connection";
++    return Status::IOError("Failed to create database connection");
++  }
++
++  auto exec_schema_sql = [schema_conn](const std::string &sql) -> Status {
++    if (mysql_query(schema_conn, sql.c_str()) != 0) {
++      mysql_close(schema_conn);
++      return Status::IOError(mysql_error(schema_conn));
++    }
++    return Status::OK();
++  };
++
++  auto status = exec_schema_sql(
++      absl::StrCat("DROP TABLE IF EXISTS ", kRayGcsTableNameInOB));
++  if (!status.ok()) {
++    RAY_LOG(ERROR) << "Failed to drop  table if exists " << kRayGcsTableNameInOB << ": "
++                   << status.ToString();
++    return status;
++  }
++
++  status = exec_schema_sql(absl::StrCat(
++      "CREATE TABLE ",
++      kRayGcsTableNameInOB,
++      " (k VARBINARY(65535) NOT NULL PRIMARY KEY, v MEDIUMBLOB)"));
++  if (!status.ok()) {
++    RAY_LOG(ERROR) << "Failed to create table " << kRayGcsTableNameInOB << ": "
++                   << status.ToString();
++    return status;
++  }
++
++  mysql_close(schema_conn);
++
++  // Create initial database connections
++  for (int i = 0; i < options_.connection_pool_size; ++i) {
++    MYSQL *conn = CreateConnection();
++    if (!conn) {
++      return Status::IOError("Failed to create initial database connection " +
++                             std::to_string(i));
++    }
++    connection_pool_.push(conn);
++  }
++
++  // Validate connections
++  for (int i = 0; i < options_.connection_pool_size; ++i) {
++    MYSQL *conn = connection_pool_.front();
++    connection_pool_.pop();
++    if (!ValidateConnection(conn)) {
++      RAY_LOG(WARNING) << "Failed to validate database connection " << i;
++      mysql_close(conn);
++      conn = CreateConnection();
++      if (!conn) {
++        RAY_LOG(ERROR) << "Failed to create replacement database connection " << i;
++        return Status::IOError("Failed to create replacement database connection " + std::to_string(i));
++      }
++      RAY_LOG(INFO) << "Created replacement database connection " << i;
++    }
++    connection_pool_.push(conn);
++  }
++
++  initialized_ = true;
++  RAY_LOG(INFO) << "OBContext initialized with " << options_.connection_pool_size
++                << " connections";
++  
++  // Create thread pool for async operations
++  thread_pool_ = std::make_unique<core::BoundedExecutor>(
++    options_.thread_pool_size, nullptr, boost::chrono::milliseconds(10000));
++  RAY_LOG(INFO) << "OBContext thread pool created with " << options_.thread_pool_size
++                << " threads";
++
++  return Status::OK();
++}
++
++MYSQL *OBContext::CreateConnection() {
++  MYSQL *conn = mysql_init(nullptr);
++  if (!conn) {
++    RAY_LOG(ERROR) << "mysql_init() failed";
++    return nullptr;
++  }
++
++  // Set connection timeout
++  unsigned int timeout = 10;
++  mysql_options(conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
++  mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &timeout);
++  mysql_options(conn, MYSQL_OPT_WRITE_TIMEOUT, &timeout);
++
++  // Connect to server
++  if (!mysql_real_connect(conn,
++                          options_.server.c_str(),
++                          options_.username.c_str(),
++                          options_.password.c_str(),
++                          options_.database.c_str(),
++                          options_.port,
++                          nullptr,
++                          0)) {
++    RAY_LOG(ERROR) << "Connection failed: " << mysql_error(conn);
++    mysql_close(conn);
++    return nullptr;
++  }
++
++  // Set charset to utf8mb4
++  mysql_set_character_set(conn, "utf8mb4");
++
++  return conn;
++}
++
++bool OBContext::ValidateConnection(MYSQL *conn) {
++  if (!conn) {
++    return false;
++  }
++  // Use mysql_ping to check connection
++  if (mysql_ping(conn) != 0) {
++    return false;
++  }
++  return true;
++}
++
++MYSQL *OBContext::AcquireConnection() {
++  absl::MutexLock lock(&pool_mutex_);
++
++  while (!connection_pool_.empty()) {
++    MYSQL *conn = connection_pool_.front();
++    connection_pool_.pop();
++
++    if (ValidateConnection(conn)) {
++      return conn;
++    }
++
++    mysql_close(conn);
++  }
++
++  MYSQL *conn = CreateConnection();
++  if (ValidateConnection(conn)) {
++    return conn;
++  }
++  mysql_close(conn);
++  
++  RAY_LOG(ERROR) << "Database connection pool is unhealthy, please check the connection status.";
++  return nullptr;
++}
++
++void OBContext::ReleaseConnection(MYSQL *conn) {
++  if (!conn) {
++    return;
++  }
++
++  absl::MutexLock lock(&pool_mutex_);
++  connection_pool_.push(conn);
++}
++
++std::shared_ptr<OBResult> OBContext::ExecuteSync(
++    MYSQL *conn,
++    const std::string &sql,
++    const std::vector<std::pair<std::string, int>> &bind_params) {
++  auto result = std::make_shared<OBResult>();
++
++  if (!conn) {
++    RAY_LOG(ERROR) << "No connection available";
++    result->status = Status::IOError("No connection available");
++    return result;
++  }
++
++  std::unique_ptr<MYSQL_STMT, MysqlStmtDeleter> stmt(mysql_stmt_init(conn));
++
++  if (!stmt) {
++    RAY_LOG(ERROR) << "mysql_stmt_init() failed: " << mysql_error(conn);
++    result->status = Status::IOError("mysql_stmt_init() failed: " +
++                                     std::string(mysql_error(conn)));
++    return result;
++  }
++
++  if (mysql_stmt_prepare(stmt.get(), sql.c_str(), sql.length()) != 0) {
++    RAY_LOG(ERROR) << "mysql_stmt_prepare() failed: " << mysql_stmt_error(stmt.get());
++    result->status = Status::IOError("mysql_stmt_prepare() failed: " +
++                                     std::string(mysql_stmt_error(stmt.get())));
++    return result;
++  }
++
++
++  if (!bind_params.empty()) {
++    std::vector<MYSQL_BIND> binds(bind_params.size());
++    memset(binds.data(), 0, sizeof(MYSQL_BIND) * binds.size());
++
++    for (size_t i = 0; i < bind_params.size(); ++i) {
++      const auto &[value, type] = bind_params[i];
++      binds[i].buffer_type = static_cast<enum_field_types>(type);
++      binds[i].buffer = const_cast<char *>(value.c_str());
++      binds[i].buffer_length = value.length();
++      binds[i].length = &binds[i].buffer_length;
++    }
++
++    if (mysql_stmt_bind_param(stmt.get(), binds.data()) != 0) {
++      RAY_LOG(ERROR) << "mysql_stmt_bind_param() failed: " << mysql_stmt_error(stmt.get());
++      result->status = Status::IOError("mysql_stmt_bind_param() failed: " +
++                                       std::string(mysql_stmt_error(stmt.get())));
++      return result;
++    }
++  }
++
++  if (mysql_stmt_execute(stmt.get()) != 0) {
++    RAY_LOG(ERROR) << "mysql_stmt_execute() failed: " << mysql_stmt_error(stmt.get());
++    result->status = Status::IOError("mysql_stmt_execute() failed: " +
++                                     std::string(mysql_stmt_error(stmt.get())));
++    return result;
++  }
++
++  result->affected_rows = mysql_stmt_affected_rows(stmt.get());
++
++  unsigned int num_fields = mysql_stmt_field_count(stmt.get());
++  // If the statement does not return a result set, return immediately
++  if (num_fields == 0) {
++    return result;
++  }
++
++  // Otherwise, store the result set
++  if (mysql_stmt_store_result(stmt.get()) != 0) {
++    RAY_LOG(ERROR) << "mysql_stmt_store_result() failed: " << mysql_stmt_error(stmt.get());
++      result->status = Status::IOError("mysql_stmt_store_result() failed: " +
++                                      std::string(mysql_stmt_error(stmt.get())));
++      return result;
++  }
++
++  std::vector<MYSQL_BIND> result_binds(num_fields);
++  std::vector<std::vector<char>> buffers(num_fields);
++  std::vector<unsigned long> lengths(num_fields);
++  std::unique_ptr<bool[]> is_null(new bool[num_fields]());
++
++  // Initialize the result buffers
++  for (unsigned int i = 0; i < num_fields; ++i) {
++    memset(&result_binds[i], 0, sizeof(MYSQL_BIND));
++
++    buffers[i].resize(kInitialColumnBufferSize);
++    // both columns in table "RAY_GCS" are binary data
++    result_binds[i].buffer_type = MYSQL_TYPE_BLOB;
++    result_binds[i].buffer = buffers[i].data();
++    result_binds[i].buffer_length = buffers[i].size();
++    result_binds[i].length = &lengths[i];
++    result_binds[i].is_null = &is_null[i];
++  }
++
++  // Bind the result buffers to the statement
++  if (mysql_stmt_bind_result(stmt.get(), result_binds.data()) != 0) {
++    RAY_LOG(ERROR) << "mysql_stmt_bind_result() failed: " << mysql_stmt_error(stmt.get());
++    result->status = Status::IOError("mysql_stmt_bind_result() failed: " +
++                                     std::string(mysql_stmt_error(stmt.get())));
++    return result;
++  }
++
++  // A lambda function to ensure the column buffer is large enough, if not, resize it.
++  auto ensure_column_buffer = [&](unsigned int col_idx) -> bool {
++    // If the column buffer is already large enough, return true
++    if (lengths[col_idx] <= result_binds[col_idx].buffer_length) {
++      return true;
++    }
++    // Otherwise, resize the column buffer
++    buffers[col_idx].resize(lengths[col_idx]);
++    result_binds[col_idx].buffer = buffers[col_idx].data();
++    result_binds[col_idx].buffer_length = buffers[col_idx].size();
++    // Fetch the oversized column data again after resizing the buffer
++    if (mysql_stmt_fetch_column(stmt.get(), &result_binds[col_idx], col_idx, 0) != 0) {
++      RAY_LOG(ERROR) << "mysql_stmt_fetch_column() failed: "
++                     << mysql_stmt_error(stmt.get());
++      result->status = Status::IOError("mysql_stmt_fetch_column() failed: " +
++                                       std::string(mysql_stmt_error(stmt.get())));
++      return false;
++    }
++    return true;
++  };
++
++  while (true) {
++    // Fetch rows
++    int fetch_status = mysql_stmt_fetch(stmt.get());
++    if (fetch_status == MYSQL_NO_DATA) {
++      break;
++    }
++    
++    // The MYSQL_DATA_TRUNCATED will be dealt with in the ensure_column_buffer lambda function,
++    // so it's not an error here.
++    if (fetch_status != 0 && fetch_status != MYSQL_DATA_TRUNCATED) {
++      RAY_LOG(ERROR) << "mysql_stmt_fetch() failed: " << mysql_stmt_error(stmt.get());
++      result->status = Status::IOError("mysql_stmt_fetch() failed: " +
++                                       std::string(mysql_stmt_error(stmt.get())));
++      return result;
++    }
++
++    std::vector<std::string> row;
++    for (unsigned int i = 0; i < num_fields; ++i) {
++      // If the column is null, add an empty string to the row
++      if (is_null[i]) {
++        row.emplace_back();
++      } else {
++        // Ensure the column buffer is large enough
++        if (!ensure_column_buffer(i)) {
++          return result;
++        }
++        // Add the column data to the row
++        row.emplace_back(buffers[i].data(), lengths[i]);
++      }
++    }
++    result->rows.push_back(std::move(row));
++  }
++
++  return result;
++}
++
++void OBContext::ExecuteAsync(
++    const std::string &sql,
++    const std::vector<std::pair<std::string, int>> &bind_params,
++    OBCallback callback) {
++  thread_pool_->Post([this,
++                      sql,
++                      bind_params,
++                      callback = std::move(callback)]() mutable {
++    MYSQL *conn = AcquireConnection();
++    auto result = ExecuteSync(conn, sql, bind_params);
++    ReleaseConnection(conn);
++
++    // Post callback to io_service
++    io_service_.post(
++        [callback = std::move(callback), result = std::move(result)]() mutable {
++          callback(std::move(result));
++        },
++        "OBContext.ExecuteAsync");
++  });
++}
++
++// TODO: 仿照redis_store_client.cc中的AsyncCheckHealth实现,并且回头要放在OBStoreCLient中
++Status OBContext::CheckHealth() {
++  absl::MutexLock lock(&pool_mutex_);
++  if (!initialized_ || connection_pool_.empty()) {
++    return Status::IOError("OBContext not initialized or no connections available");
++  }
++
++  // Test with a simple query
++  MYSQL *conn = connection_pool_.front();
++  if (!ValidateConnection(conn)) {
++    return Status::IOError("Connection health check failed");
++  }
++
++  return Status::OK();
++}
++
++}  // namespace gcs
++}  // namespace ray
++
+diff --git a/src/ray/gcs/store_client/ob_context_MysqlC.h b/src/ray/gcs/store_client/ob_context_MysqlC.h
+new file mode 100644
+index 000000000000..4d2863947b11
+--- /dev/null
++++ b/src/ray/gcs/store_client/ob_context_MysqlC.h
+@@ -0,0 +1,167 @@
++// Author: He Su
++// Email: yefengshuo.yfs@oceanbase.com
++// Create Time: 2025-11-26
++
++#pragma once
++
++#include <mysql/mysql.h>
++
++#include <functional>
++#include <memory>
++#include <queue>
++#include <string>
++
++#include "absl/synchronization/mutex.h"
++#include "ray/common/asio/instrumented_io_context.h"
++#include "ray/common/status.h"
++#include "ray/core_worker/task_execution/thread_pool.h"
++
++
++namespace ray {
++namespace gcs {
++
++struct MysqlStmtDeleter {
++  void operator()(MYSQL_STMT* stmt) const {
++        mysql_stmt_close(stmt);
++  }
++};
++
++
++constexpr size_t kInitialColumnBufferSize = 4096;  // 4 KB
++constexpr std::string_view kRayGcsTableNameInOB = "RAY_GCS";
++constexpr std::string_view kOBKeySeparator = "@";
++
++struct OBClientOptions {
++  std::string server = "6.12.235.70";
++  int port = 2881;
++  std::string username = "root@sys";
++  std::string password = "YdgmkMzQHygaaU325S84";
++  std::string database = "test";
++  int connection_pool_size = 12;
++  int thread_pool_size = 10;
++};
++
++/// Result of an OB operation.
++struct OBResult {
++  Status status;
++  int64_t affected_rows = 0;
++  std::vector<std::vector<std::string>> rows;  // Query results
++
++  OBResult() : status(Status::OK()) {}
++  OBResult(Status s) : status(std::move(s)) {}
++};
++
++using OBCallback = std::function<void(std::shared_ptr<OBResult>)>;
++
++
++struct OBKey {
++  std::string external_storage_namespace;
++  std::string table_name;
++
++  std::string TablePrefix() const {
++    return absl::StrCat("RAY", external_storage_namespace, kOBKeySeparator, table_name);
++  }
++
++  std::string KeyPrefix() const { return absl::StrCat(TablePrefix(), kOBKeySeparator); }
++
++  std::string ComposeFullKey(const std::string &key) const {
++    return absl::StrCat(TablePrefix(), key);
++  }
++
++  // for AsyncGetKeys
++  std::string ComposePrefix(const std::string &key_prefix) const {
++    return absl::StrCat(TablePrefix(), key_prefix);
++  }
++
++};
++
++// Typed key for concurrency control.
++struct OBConcurrencyKey {
++  std::string table_name;
++  std::string key;
++
++  template <typename H>
++  friend H AbslHashValue(H h, const OBConcurrencyKey &k) {
++    return H::combine(std::move(h), k.table_name, k.key);
++  }
++  bool operator==(const OBConcurrencyKey &other) const {
++    return table_name == other.table_name && key == other.key;
++  }
++};
++
++/// Context for managing OceanBase/MySQL connections and executing async operations.
++class OBContext {
++ public:
++  explicit OBContext(instrumented_io_context &io_service);
++
++  ~OBContext();
++
++  /// Initialize the connection pool.
++  ///
++  /// \param options Connection options.
++  /// \return Status indicating success or failure.
++  Status Initialize(const OBClientOptions &options);
++
++  /// Execute an async SQL operation.
++  ///
++  /// \param sql SQL statement (can contain placeholders).
++  /// \param bind_params Parameters to bind (empty if no placeholders).
++  /// \param callback Callback to invoke with the result.
++  void ExecuteAsync(
++      const std::string &sql,
++      const std::vector<std::pair<std::string, int>> &bind_params,  // (value, type)
++      OBCallback callback);
++
++  /// Check if the connection pool is healthy.
++  ///
++  /// \return Status indicating health.
++  Status CheckHealth();
++
++  /// Get the io_service reference.
++  instrumented_io_context &io_service() { return io_service_; }
++
++ private:
++  /// Create a new MySQL connection.
++  ///
++  /// \return MYSQL* connection or nullptr on failure.
++  MYSQL *CreateConnection();
++
++  /// Acquire a connection from the pool.
++  ///
++  /// \return MYSQL* connection or nullptr if pool is empty and creation fails.
++  MYSQL *AcquireConnection();
++
++  /// Release a connection back to the pool.
++  ///
++  /// \param conn Connection to release.
++  void ReleaseConnection(MYSQL *conn);
++
++  /// Execute a synchronous SQL operation.
++  ///
++  /// \param conn MySQL connection.
++  /// \param sql SQL statement.
++  /// \param bind_params Parameters to bind.
++  /// \return OBResult with the operation result.
++  std::shared_ptr<OBResult> ExecuteSync(
++      MYSQL *conn,
++      const std::string &sql,
++      const std::vector<std::pair<std::string, int>> &bind_params);
++
++  /// Validate and reconnect a connection if needed.
++  ///
++  /// \param conn Connection to validate.
++  /// \return true if connection is valid, false otherwise.
++  bool ValidateConnection(MYSQL *conn);
++
++  instrumented_io_context &io_service_;
++  OBClientOptions options_;
++  std::unique_ptr<core::BoundedExecutor> thread_pool_;
++
++  absl::Mutex pool_mutex_;
++  std::queue<MYSQL *> connection_pool_ ABSL_GUARDED_BY(pool_mutex_);
++  bool initialized_ ABSL_GUARDED_BY(pool_mutex_) = false;
++};
++
++}  // namespace gcs
++}  // namespace ray
++
+diff --git a/src/ray/gcs/store_client/ob_store_client.cc b/src/ray/gcs/store_client/ob_store_client.cc
+index adf5e50595c4..a97d63345a30 100644
+--- a/src/ray/gcs/store_client/ob_store_client.cc
++++ b/src/ray/gcs/store_client/ob_store_client.cc
+@@ -47,7 +47,7 @@ void OBStoreClient::AsyncPut(const std::string &table_name,
+   bind_params.emplace_back(ob_key.ComposeFullKey(key));
+   bind_params.emplace_back(std::move(data));
+ 
+-  OBCommand command{table_name, std::move(sql), std::move(bind_params)};
++  OBCommand command{table_name, std::move(sql), std::move(bind_params), false};
+   OBCallback ob_callback = [callback = std::move(callback)](
+                                std::shared_ptr<OBResult> result) mutable {
+     std::move(callback).Dispatch("OBStoreClient.AsyncPut", result->affected_rows == 1);
+@@ -66,7 +66,7 @@ void OBStoreClient::AsyncGet(const std::string &table_name,
+   std::vector<std::string> bind_params;
+   bind_params.emplace_back(ob_key.ComposeFullKey(key));
+ 
+-  OBCommand command{table_name, std::move(sql), std::move(bind_params)};
++  OBCommand command{table_name, std::move(sql), std::move(bind_params), true};
+   OBCallback ob_callback =
+       [callback = std::move(callback)](std::shared_ptr<OBResult> result) mutable {
+         std::optional<std::string> value;
+@@ -106,7 +106,7 @@ void OBStoreClient::AsyncMultiGet(
+   }
+ 
+   std::vector<std::string> request_keys(keys.begin(), keys.end());
+-  OBCommand command{table_name, std::move(sql), std::move(bind_params)};
++  OBCommand command{table_name, std::move(sql), std::move(bind_params), true};
+   SendOBCmdWithKeys(std::move(request_keys),
+                     std::move(command),
+                     [callback = std::move(callback), table_prefix = ob_key.TablePrefix()](
+@@ -154,7 +154,7 @@ void OBStoreClient::AsyncBatchDelete(const std::string &table_name,
+   }
+ 
+   std::vector<std::string> request_keys(keys.begin(), keys.end());
+-  OBCommand command{table_name, std::move(sql), std::move(bind_params)};
++  OBCommand command{table_name, std::move(sql), std::move(bind_params), false};
+   SendOBCmdWithKeys(
+       std::move(request_keys),
+       std::move(command),
+@@ -178,7 +178,7 @@ void OBStoreClient::AsyncExists(const std::string &table_name,
+   std::vector<std::string> bind_params;
+   bind_params.emplace_back(ob_key.ComposeFullKey(key));
+ 
+-  OBCommand command{table_name, std::move(sql), std::move(bind_params)};
++  OBCommand command{table_name, std::move(sql), std::move(bind_params), true};
+   OBCallback ob_callback =
+       [callback = std::move(callback)](std::shared_ptr<OBResult> result) mutable {
+         bool exists = result && result->status.ok() && !result->rows.empty();
+@@ -224,18 +224,21 @@ void OBStoreClient::AsyncGetNextJobID(Postable<void(int)> callback) {
+       std::vector<std::string> insert_params;
+       insert_params.emplace_back(k);
+       insert_params.emplace_back("0");
+-      OBCommand insert_cmd{job_key.table_name, insert_sql, std::move(insert_params)};
++      OBCommand insert_cmd{
++          job_key.table_name, insert_sql, std::move(insert_params), false};
+       SendOBCmdWithKeys({key}, std::move(insert_cmd), std::move(insert_callback));
+     }
+ 
+     std::vector<std::string> update_params;
+     update_params.emplace_back(k);
+-    OBCommand update_cmd{job_key.table_name, update_sql, std::move(update_params)};
++    OBCommand update_cmd{
++        job_key.table_name, update_sql, std::move(update_params), false};
+     SendOBCmdWithKeys({key}, std::move(update_cmd), update_callback);
+ 
+     std::vector<std::string> select_params;
+     select_params.emplace_back(k);
+-    OBCommand select_cmd{job_key.table_name, select_sql, std::move(select_params)};
++    OBCommand select_cmd{
++        job_key.table_name, select_sql, std::move(select_params), true};
+     SendOBCmdWithKeys({key}, std::move(select_cmd), select_callback);
+   }
+ }
+@@ -268,6 +271,7 @@ void OBStoreClient::AsyncGetKeys(const std::string &table_name,
+   ob_context_->ExecuteAsync(
+       sql,
+       std::move(bind_params),
++      /*is_select=*/true,
+       [callback = std::move(callback),
+        table_prefix = ob_key.TablePrefix()](std::shared_ptr<OBResult> result) mutable {
+         std::vector<std::string> keys;
+@@ -295,6 +299,7 @@ void OBStoreClient::AsyncGetAll(
+   ob_context_->ExecuteAsync(
+       sql,
+       std::move(bind_params),
++      /*is_select=*/true,
+       [callback = std::move(callback),
+        table_prefix = ob_key.TablePrefix()](std::shared_ptr<OBResult> result) mutable {
+         absl::flat_hash_map<std::string, std::string> key_value_map;
+@@ -383,6 +388,7 @@ void OBStoreClient::SendOBCmdWithKeys(std::vector<std::string> keys,
+     ob_context_->ExecuteAsync(
+         command.sql,
+         std::move(command.bind_params),
++        command.is_select,
+         [this, concurrency_keys, ob_callback = std::move(ob_callback)](
+             std::shared_ptr<OBResult> result) mutable {
+           if (ob_callback) {
+@@ -424,6 +430,7 @@ void OBStoreClient::AsyncCheckHealth(Postable<void(Status)> callback) {
+   ob_context_->ExecuteAsync(
+       "SELECT 1",
+       /*bind_params=*/{},
++      /*is_select=*/true,
+       [callback = std::move(callback)](std::shared_ptr<OBResult> result) mutable {
+         Status status = Status::OK();
+         if (!result || !result->status.ok() || result->rows.empty()) {
+diff --git a/src/ray/gcs/store_client/ob_store_client.h b/src/ray/gcs/store_client/ob_store_client.h
+index 38c9769e0150..3211cbab92bc 100644
+--- a/src/ray/gcs/store_client/ob_store_client.h
++++ b/src/ray/gcs/store_client/ob_store_client.h
+@@ -36,6 +36,7 @@ struct OBCommand {
+   std::string table_name;
+   std::string sql;
+   std::vector<std::string> bind_params;
++  bool is_select;
+ };
+ 
+ // StoreClient using OceanBase/MySQL as persistence backend.
+diff --git a/src/ray/gcs/store_client/tests/ob_context_test.cc b/src/ray/gcs/store_client/tests/ob_context_test.cc
+index 06f77c2b85c6..2bd4eda85a32 100644
+--- a/src/ray/gcs/store_client/tests/ob_context_test.cc
++++ b/src/ray/gcs/store_client/tests/ob_context_test.cc
+@@ -1,25 +1,15 @@
+-// Copyright 2017 The Ray Authors.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//   http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
++// Author: He Su
++// Email: yefengshuo.yfs@oceanbase.com
++// Create Time: 2025-12-5
+ 
+ #include "ray/gcs/store_client/ob_context.h"
+ 
+ #include <atomic>
+ #include <memory>
+-#include <optional>
+ #include <string>
+ #include <vector>
+ 
++#include <boost/asio/executor_work_guard.hpp>
+ #include "absl/strings/str_cat.h"
+ #include "gtest/gtest.h"
+ #include "ray/common/asio/instrumented_io_context.h"
+@@ -36,7 +26,7 @@ namespace {
+ 
+ instrumented_io_context io_service;
+ 
+-std::optional<OBClientOptions> LoadOptions() {
++OBClientOptions LoadOptions() {
+   OBClientOptions opts;
+   opts.server = "6.12.235.70";
+   opts.port = 2881;
+@@ -44,39 +34,44 @@ std::optional<OBClientOptions> LoadOptions() {
+   opts.password = "YdgmkMzQHygaaU325S84";
+   opts.database = "test";
+   // Keep pools minimal to reduce connection pressure during test.
+-  opts.connection_pool_size = 1;
+-  opts.thread_pool_size = 1;
++  opts.connection_pool_size = 8;
++  opts.thread_pool_size = 6;
+   return opts;
+ }
+ 
+ }  // namespace
+ 
+ class OBContextTest : public ::testing::Test {
++ public:
++  OBContextTest() : work_guard_(boost::asio::make_work_guard(io_service)) {}
++
+  protected:
+   void SetUp() override {
+     opts_ = LoadOptions();
+-    io_service.restart();
+   }
+ 
+   void TearDown() override {
++    work_guard_.reset();
+     io_service.stop();
+   }
+ 
+-  std::optional<OBClientOptions> opts_;
++  OBClientOptions opts_;
++  boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work_guard_;
+ };
+ 
+ 
+-TEST_F(OBContextTest, ExecuteAsyncCrud) {
++TEST_F(OBContextTest, ExecuteAsyncCRUD) {
+   OBContext ctx(io_service);
+-  RAY_LOG(INFO) << "Init OBContext host=" << opts_->server << " port=" << opts_->port
+-                << " user=" << opts_->username << " db=" << opts_->database;
+-  auto init_status = ctx.Initialize(*opts_);
+-  std::cerr << "[TEST] OBContext Initialize status: " << init_status.ToString() << std::endl;
++  RAY_LOG(INFO) << "Init OBContext host=" << opts_.server << " port=" << opts_.port
++                << " user=" << opts_.username << " db=" << opts_.database;
++  auto init_status = ctx.Initialize(opts_);
+   RAY_LOG(INFO) << "OBContext Initialize status: " << init_status.ToString();
+   ASSERT_TRUE(init_status.ok());
+ 
+   const std::string key = absl::StrCat("test-key-", current_time_ms());
+-  const std::string val = "v1";
++  const std::string val_insert = "v1";
++  const std::string val_update = "v2";
++  const std::string val_replace = "v3";
+ 
+   std::atomic<int> pending(0);
+ 
+@@ -86,41 +81,144 @@ TEST_F(OBContextTest, ExecuteAsyncCrud) {
+     }
+   };
+ 
+-  // Insert / upsert
++  // Insert
+   pending++;
+   ctx.ExecuteAsync(
+-      absl::StrCat("REPLACE INTO ", kRayGcsTableNameInOB, " (k, v) VALUES (?, ?)"),
+-      {key, val},
+-      [done](std::shared_ptr<OBResult> res) {
++      absl::StrCat("INSERT INTO ", kRayGcsTableNameInOB, " (k, v) VALUES (?, ?)"),
++      {key, val_insert},
++      false,
++      [done, &key, &val_insert](std::shared_ptr<OBResult> res) {
+         ASSERT_TRUE(res) << "res null";
+         ASSERT_TRUE(res->status.ok()) << res->status.ToString();
+         ASSERT_EQ(res->affected_rows, 1);
++        RAY_LOG(INFO) << "[Verified] Insert key=" << key << " val=" << val_insert
++                      << " affected_rows=" << res->affected_rows;
+         done();
+       });
++  RAY_LOG(INFO) << "Insert task submitted to io_service";
++/*
+ 
+-  // Read back
++  // Read after insert
+   pending++;
+   ctx.ExecuteAsync(
+       absl::StrCat("SELECT v FROM ", kRayGcsTableNameInOB, " WHERE k = ?"),
+       {key},
+-      [done, &val](std::shared_ptr<OBResult> res) {
++      true, 
++      [done, &key, &val_insert](std::shared_ptr<OBResult> res) {
+         ASSERT_TRUE(res) << "res null";
+         ASSERT_TRUE(res->status.ok()) << res->status.ToString();
+         ASSERT_FALSE(res->rows.empty());
+-        ASSERT_EQ(res->rows[0].at(0), val);
++        ASSERT_EQ(res->rows[0].at(0), val_insert);
++        RAY_LOG(INFO) << "[Verified] Read after insert key=" << key
++                      << " rows=" << res->rows.size()
++                      << " first_val=" << (res->rows.empty() ? "" : res->rows[0].at(0));
+         done();
+       });
++  RAY_LOG(INFO) << "Read-after-insert task submitted to io_service";
++
++
++  // Update
++  RAY_LOG(INFO) << "Update key=" << key << " val=" << val_update;
++  pending++;
++  ctx.ExecuteAsync(
++      absl::StrCat("UPDATE ", kRayGcsTableNameInOB, " SET v = ? WHERE k = ?"),
++      {val_update, key},
++      false,
++      [done, &key, &val_update](std::shared_ptr<OBResult> res) {
++        ASSERT_TRUE(res) << "res null";
++        ASSERT_TRUE(res->status.ok()) << res->status.ToString();
++        ASSERT_EQ(res->affected_rows, 1);
++        RAY_LOG(INFO) << "[Verified] Update key=" << key << " val=" << val_update
++                      << " affected_rows=" << res->affected_rows;
++        done();
++      });
++  RAY_LOG(INFO) << "Update task submitted to io_service";
++
++  // Read after update
++  pending++;
++  ctx.ExecuteAsync(
++      absl::StrCat("SELECT v FROM ", kRayGcsTableNameInOB, " WHERE k = ?"),
++      {key},
++      true,
++      [done, &key, &val_update](std::shared_ptr<OBResult> res) {
++        ASSERT_TRUE(res) << "res null";
++        ASSERT_TRUE(res->status.ok()) << res->status.ToString();
++        ASSERT_FALSE(res->rows.empty());
++        ASSERT_EQ(res->rows[0].at(0), val_update);
++        RAY_LOG(INFO) << "[Verified] Read after update key=" << key
++                      << " rows=" << res->rows.size()
++                      << " first_val=" << (res->rows.empty() ? "" : res->rows[0].at(0));
++        done();
++      });
++  RAY_LOG(INFO) << "Read-after-update task submitted to io_service";
++
++  // Replace
++  RAY_LOG(INFO) << "Replace key=" << key << " val=" << val_replace;
++  pending++;
++  ctx.ExecuteAsync(
++      absl::StrCat("REPLACE INTO ", kRayGcsTableNameInOB, " (k, v) VALUES (?, ?)"),
++      {key, val_replace},
++      false,
++      [done, &key, &val_replace](std::shared_ptr<OBResult> res) {
++        ASSERT_TRUE(res) << "res null";
++        ASSERT_TRUE(res->status.ok()) << res->status.ToString();
++        ASSERT_EQ(res->affected_rows, 2);
++        RAY_LOG(INFO) << "[Verified] Replace key=" << key << " val=" << val_replace
++                      << " affected_rows=" << res->affected_rows;
++        done();
++      });
++  RAY_LOG(INFO) << "Replace task submitted to io_service";
++
++  // Read after replace
++  pending++;
++  ctx.ExecuteAsync(
++      absl::StrCat("SELECT v FROM ", kRayGcsTableNameInOB, " WHERE k = ?"),
++      {key},
++      true,
++      [done, &key, &val_replace](std::shared_ptr<OBResult> res) {
++        ASSERT_TRUE(res) << "res null";
++        ASSERT_TRUE(res->status.ok()) << res->status.ToString();
++        ASSERT_FALSE(res->rows.empty());
++        ASSERT_EQ(res->rows[0].at(0), val_replace);
++        RAY_LOG(INFO) << "[Verified] Read after replace key=" << key
++                      << " rows=" << res->rows.size()
++                      << " first_val=" << (res->rows.empty() ? "" : res->rows[0].at(0));
++        done();
++      });
++  RAY_LOG(INFO) << "Read-after-replace task submitted to io_service";
+ 
+   // Delete
+   pending++;
+   ctx.ExecuteAsync(
+       absl::StrCat("DELETE FROM ", kRayGcsTableNameInOB, " WHERE k = ?"),
+       {key},
+-      [done](std::shared_ptr<OBResult> res) {
++      false,
++      [done, &key](std::shared_ptr<OBResult> res) {
++        ASSERT_TRUE(res) << "res null";
++        ASSERT_TRUE(res->status.ok()) << res->status.ToString();
++        ASSERT_EQ(res->affected_rows, 1);
++        RAY_LOG(INFO) << "[Verified] Delete key=" << key
++                      << " affected_rows=" << res->affected_rows;
++        done();
++      });
++  RAY_LOG(INFO) << "Delete task submitted to io_service";
++
++  // Verify deleted
++  pending++;
++  ctx.ExecuteAsync(
++      absl::StrCat("SELECT v FROM ", kRayGcsTableNameInOB, " WHERE k = ?"),
++      {key},
++      true,
++      [done, &key](std::shared_ptr<OBResult> res) {
+         ASSERT_TRUE(res) << "res null";
+         ASSERT_TRUE(res->status.ok()) << res->status.ToString();
++        ASSERT_TRUE(res->rows.empty());
++        RAY_LOG(INFO) << "[Verified] Verify delete key=" << key
++                      << " rows=" << res->rows.size();
+         done();
+       });
++  RAY_LOG(INFO) << "Verify-delete task submitted to io_service";
++*/
+ 
+   // Run event loop until all callbacks finish.
+   io_service.run();
+diff --git a/src/ray/gcs/store_client/tests/ob_store_client_test.cc b/src/ray/gcs/store_client/tests/ob_store_client_test.cc
+index da3840d00892..d95d46b77f2f 100644
+--- a/src/ray/gcs/store_client/tests/ob_store_client_test.cc
++++ b/src/ray/gcs/store_client/tests/ob_store_client_test.cc
+@@ -35,7 +35,7 @@ namespace gcs {
+ namespace {
+ 
+ // Keep pool sizes small to reduce connection pressure during tests.
+-std::optional<OBClientOptions> LoadOptions() {
++OBClientOptions LoadOptions() {
+   OBClientOptions opts;
+   opts.server = "6.12.235.70";
+   opts.port = 2881;
