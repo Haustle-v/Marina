@@ -1,0 +1,114 @@
+From adf965268b47aca007188ccdc6718e43b6c74881 Mon Sep 17 00:00:00 2001
+From: He Su <yefengshuo.yfs@oceanbase.com>
+Date: Thu, 11 Dec 2025 01:38:14 -0800
+Subject: [PATCH] Pass ob_context_test
+
+---
+ .../gcs/store_client/tests/ob_context_test.cc | 28 +++++++++----------
+ 1 file changed, 13 insertions(+), 15 deletions(-)
+
+diff --git a/src/ray/gcs/store_client/tests/ob_context_test.cc b/src/ray/gcs/store_client/tests/ob_context_test.cc
+index 2bd4eda85a32..ec6d2db431ac 100644
+--- a/src/ray/gcs/store_client/tests/ob_context_test.cc
++++ b/src/ray/gcs/store_client/tests/ob_context_test.cc
+@@ -34,8 +34,8 @@ OBClientOptions LoadOptions() {
+   opts.password = "YdgmkMzQHygaaU325S84";
+   opts.database = "test";
+   // Keep pools minimal to reduce connection pressure during test.
+-  opts.connection_pool_size = 8;
+-  opts.thread_pool_size = 6;
++  opts.connection_pool_size = 1;
++  opts.thread_pool_size = 1;
+   return opts;
+ }
+ 
+@@ -90,13 +90,12 @@ TEST_F(OBContextTest, ExecuteAsyncCRUD) {
+       [done, &key, &val_insert](std::shared_ptr<OBResult> res) {
+         ASSERT_TRUE(res) << "res null";
+         ASSERT_TRUE(res->status.ok()) << res->status.ToString();
+-        ASSERT_EQ(res->affected_rows, 1);
++        ASSERT_EQ(res->affected_rows, 1) << "affected_rows should be 1 in the insert sql";
+         RAY_LOG(INFO) << "[Verified] Insert key=" << key << " val=" << val_insert
+                       << " affected_rows=" << res->affected_rows;
+         done();
+       });
+   RAY_LOG(INFO) << "Insert task submitted to io_service";
+-/*
+ 
+   // Read after insert
+   pending++;
+@@ -107,8 +106,8 @@ TEST_F(OBContextTest, ExecuteAsyncCRUD) {
+       [done, &key, &val_insert](std::shared_ptr<OBResult> res) {
+         ASSERT_TRUE(res) << "res null";
+         ASSERT_TRUE(res->status.ok()) << res->status.ToString();
+-        ASSERT_FALSE(res->rows.empty());
+-        ASSERT_EQ(res->rows[0].at(0), val_insert);
++        ASSERT_FALSE(res->rows.empty()) << "select after insert returned empty rows";
++        ASSERT_EQ(res->rows[0].at(0), val_insert) << "select after insert got wrong value";
+         RAY_LOG(INFO) << "[Verified] Read after insert key=" << key
+                       << " rows=" << res->rows.size()
+                       << " first_val=" << (res->rows.empty() ? "" : res->rows[0].at(0));
+@@ -127,7 +126,7 @@ TEST_F(OBContextTest, ExecuteAsyncCRUD) {
+       [done, &key, &val_update](std::shared_ptr<OBResult> res) {
+         ASSERT_TRUE(res) << "res null";
+         ASSERT_TRUE(res->status.ok()) << res->status.ToString();
+-        ASSERT_EQ(res->affected_rows, 1);
++        ASSERT_EQ(res->affected_rows, 1) << "affected_rows should be 1 in the update sql";
+         RAY_LOG(INFO) << "[Verified] Update key=" << key << " val=" << val_update
+                       << " affected_rows=" << res->affected_rows;
+         done();
+@@ -143,8 +142,8 @@ TEST_F(OBContextTest, ExecuteAsyncCRUD) {
+       [done, &key, &val_update](std::shared_ptr<OBResult> res) {
+         ASSERT_TRUE(res) << "res null";
+         ASSERT_TRUE(res->status.ok()) << res->status.ToString();
+-        ASSERT_FALSE(res->rows.empty());
+-        ASSERT_EQ(res->rows[0].at(0), val_update);
++        ASSERT_FALSE(res->rows.empty()) << "select after update returned empty rows";
++        ASSERT_EQ(res->rows[0].at(0), val_update) << "select after update got wrong value";
+         RAY_LOG(INFO) << "[Verified] Read after update key=" << key
+                       << " rows=" << res->rows.size()
+                       << " first_val=" << (res->rows.empty() ? "" : res->rows[0].at(0));
+@@ -162,7 +161,7 @@ TEST_F(OBContextTest, ExecuteAsyncCRUD) {
+       [done, &key, &val_replace](std::shared_ptr<OBResult> res) {
+         ASSERT_TRUE(res) << "res null";
+         ASSERT_TRUE(res->status.ok()) << res->status.ToString();
+-        ASSERT_EQ(res->affected_rows, 2);
++        ASSERT_EQ(res->affected_rows, 2) << "affected_rows should be 2 in the replace sql";
+         RAY_LOG(INFO) << "[Verified] Replace key=" << key << " val=" << val_replace
+                       << " affected_rows=" << res->affected_rows;
+         done();
+@@ -178,8 +177,8 @@ TEST_F(OBContextTest, ExecuteAsyncCRUD) {
+       [done, &key, &val_replace](std::shared_ptr<OBResult> res) {
+         ASSERT_TRUE(res) << "res null";
+         ASSERT_TRUE(res->status.ok()) << res->status.ToString();
+-        ASSERT_FALSE(res->rows.empty());
+-        ASSERT_EQ(res->rows[0].at(0), val_replace);
++        ASSERT_FALSE(res->rows.empty()) << "select after replace returned empty rows";
++        ASSERT_EQ(res->rows[0].at(0), val_replace) << "select after replace got wrong value";
+         RAY_LOG(INFO) << "[Verified] Read after replace key=" << key
+                       << " rows=" << res->rows.size()
+                       << " first_val=" << (res->rows.empty() ? "" : res->rows[0].at(0));
+@@ -196,7 +195,7 @@ TEST_F(OBContextTest, ExecuteAsyncCRUD) {
+       [done, &key](std::shared_ptr<OBResult> res) {
+         ASSERT_TRUE(res) << "res null";
+         ASSERT_TRUE(res->status.ok()) << res->status.ToString();
+-        ASSERT_EQ(res->affected_rows, 1);
++        ASSERT_EQ(res->affected_rows, 1) << "affected_rows should be 1 in the delete sql";
+         RAY_LOG(INFO) << "[Verified] Delete key=" << key
+                       << " affected_rows=" << res->affected_rows;
+         done();
+@@ -212,13 +211,12 @@ TEST_F(OBContextTest, ExecuteAsyncCRUD) {
+       [done, &key](std::shared_ptr<OBResult> res) {
+         ASSERT_TRUE(res) << "res null";
+         ASSERT_TRUE(res->status.ok()) << res->status.ToString();
+-        ASSERT_TRUE(res->rows.empty());
++        ASSERT_TRUE(res->rows.empty()) << "select after delete should return empty rows";
+         RAY_LOG(INFO) << "[Verified] Verify delete key=" << key
+                       << " rows=" << res->rows.size();
+         done();
+       });
+   RAY_LOG(INFO) << "Verify-delete task submitted to io_service";
+-*/
+ 
+   // Run event loop until all callbacks finish.
+   io_service.run();
