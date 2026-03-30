@@ -4,6 +4,7 @@
 poetry.lock
 tests/.env
 __pycache__/
+.vscode/
 build/
 
 # demo
@@ -17,3 +18,6 @@ venv.bak/
 demo/rag/data/
 geneva_demo_db/
 geneva-0.7.0/
+datasets/
+pretrained_model/
+database_geneva/
