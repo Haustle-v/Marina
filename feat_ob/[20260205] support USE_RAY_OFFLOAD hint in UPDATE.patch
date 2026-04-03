@@ -1,0 +1,205 @@
+From f6929cc8122d9931af109eef58999fff92e1d512 Mon Sep 17 00:00:00 2001
+From: He Su <yefengshuo.yfs@oceanbase.com>
+Date: Thu, 5 Feb 2026 11:07:41 +0800
+Subject: [PATCH 4/7] [backfill()][parser/resolver] support UPDATE /*+
+ USE_RAY_OFFLOAD */ t SET ...
+
+---
+ src/objit/include/objit/common/ob_item_type.h       | 1 +
+ src/sql/parser/sql_parser_mysql_mode.l              | 1 +
+ src/sql/parser/sql_parser_mysql_mode.y              | 6 +++++-
+ src/sql/resolver/ddl/ob_alter_table_resolver.cpp    | 1 -
+ src/sql/resolver/ddl/ob_create_routine_resolver.cpp | 9 ++++-----
+ src/sql/resolver/ddl/ob_ddl_resolver.cpp            | 1 -
+ src/sql/resolver/dml/ob_dml_resolver.cpp            | 5 +++++
+ src/sql/resolver/dml/ob_hint.cpp                    | 5 +++++
+ src/sql/resolver/dml/ob_hint.h                      | 4 +++-
+ tools/deploy/init.sql                               | 3 +++
+ 10 files changed, 27 insertions(+), 9 deletions(-)
+
+diff --git a/src/objit/include/objit/common/ob_item_type.h b/src/objit/include/objit/common/ob_item_type.h
+index 6322b220fb10..839a1c0c80bd 100644
+--- a/src/objit/include/objit/common/ob_item_type.h
++++ b/src/objit/include/objit/common/ob_item_type.h
+@@ -3016,6 +3016,7 @@ typedef enum ObItemType
+ 
+   T_CSV_LARGE_FILE_SIZE_THRESHOLD = 4957,
+   T_MAX_CSV_ROW_LENGTH = 4958,
++  T_USE_RAY_OFFLOAD = 4959,
+   T_MAX //Attention: add a new type before T_MAX
+ } ObItemType;
+ 
+diff --git a/src/sql/parser/sql_parser_mysql_mode.l b/src/sql/parser/sql_parser_mysql_mode.l
+index 217eb7c44092..4e7a377f3670 100644
+--- a/src/sql/parser/sql_parser_mysql_mode.l
++++ b/src/sql/parser/sql_parser_mysql_mode.l
+@@ -1011,6 +1011,7 @@ Timestamp{whitespace}?\"[^\"]*\" {
+ <hint>NO_INDEX_MERGE { return NO_INDEX_MERGE_HINT; }
+ <hint>USE_DAS { return USE_DAS_HINT; }
+ <hint>NO_USE_DAS { return NO_USE_DAS_HINT; }
++<hint>USE_RAY_OFFLOAD { return USE_RAY_OFFLOAD; }
+ <hint>INDEX_SS { return INDEX_SS_HINT; }
+ <hint>INDEX_SS_ASC { return INDEX_SS_ASC_HINT; }
+ <hint>INDEX_SS_DESC { return INDEX_SS_DESC_HINT; }
+diff --git a/src/sql/parser/sql_parser_mysql_mode.y b/src/sql/parser/sql_parser_mysql_mode.y
+index 75d7b9b2c846..12b58b362cdb 100644
+--- a/src/sql/parser/sql_parser_mysql_mode.y
++++ b/src/sql/parser/sql_parser_mysql_mode.y
+@@ -168,7 +168,7 @@ FROZEN_VERSION TOPK QUERY_TIMEOUT READ_CONSISTENCY LOG_LEVEL USE_PLAN_CACHE
+ TRACE_LOG LOAD_BATCH_SIZE TRANS_PARAM OPT_PARAM OB_DDL_SCHEMA_VERSION FORCE_REFRESH_LOCATION_CACHE
+ ENABLE_PARALLEL_DAS_DML DISABLE_PARALLEL_DAS_DML DISABLE_PARALLEL_DML ENABLE_PARALLEL_DML MONITOR NO_PARALLEL CURSOR_SHARING_EXACT
+ MAX_CONCURRENT DOP TRACING NO_QUERY_TRANSFORMATION NO_COST_BASED_QUERY_TRANSFORMATION BLOCKING RESOURCE_GROUP
+-PX_NODE_POLICY PX_NODE_ADDRS PX_NODE_COUNT DML_PARALLEL DISABLE_OP_RICH_FORMAT DISABLE_TRIGGER
++PX_NODE_POLICY PX_NODE_ADDRS PX_NODE_COUNT DML_PARALLEL DISABLE_OP_RICH_FORMAT DISABLE_TRIGGER USE_RAY_OFFLOAD
+ // transform hint
+ NO_REWRITE MERGE_HINT NO_MERGE_HINT NO_EXPAND USE_CONCAT NO_UNNEST
+ PLACE_GROUP_BY NO_PLACE_GROUP_BY INLINE MATERIALIZE SEMI_TO_INNER NO_SEMI_TO_INNER
+@@ -12529,6 +12529,10 @@ READ_CONSISTENCY '(' consistency_level ')'
+   malloc_terminal_node($$, result->malloc_pool_, T_USE_PLAN_CACHE);
+   $$->value_ = $3[0];
+ }
++| USE_RAY_OFFLOAD
++{
++  malloc_terminal_node($$, result->malloc_pool_, T_USE_RAY_OFFLOAD);
++}
+ | CURSOR_SHARING_EXACT
+ {
+   malloc_terminal_node($$, result->malloc_pool_, T_CURSOR_SHARING_EXACT);
+diff --git a/src/sql/resolver/ddl/ob_alter_table_resolver.cpp b/src/sql/resolver/ddl/ob_alter_table_resolver.cpp
+index 19c427925006..13d9105593a2 100644
+--- a/src/sql/resolver/ddl/ob_alter_table_resolver.cpp
++++ b/src/sql/resolver/ddl/ob_alter_table_resolver.cpp
+@@ -6411,7 +6411,6 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
+     }
+     add_column_cnt_++;
+   }
+-  FLOG_INFO("ObAlterTableResolver::resolve_add_column() exit", K(ret), K(lbt()));
+   return ret;
+ }
+ 
+diff --git a/src/sql/resolver/ddl/ob_create_routine_resolver.cpp b/src/sql/resolver/ddl/ob_create_routine_resolver.cpp
+index 97f9e6d4ca3c..6d72fbbd2d79 100644
+--- a/src/sql/resolver/ddl/ob_create_routine_resolver.cpp
++++ b/src/sql/resolver/ddl/ob_create_routine_resolver.cpp
+@@ -1379,7 +1379,7 @@ int ObCreateRoutineResolver::resolve_external_udf(const ParseNode &parse_tree,
+         LOG_WARN("failed to resolve external routine type", K(ret), K(udf_type), K(file), K(mode), K(input_columns), K(routine_info));
+       }
+ 
+-      LOG_INFO("finished to resolve external UDF", K(ret), K(entry_name), K(udf_type), K(file), K(mode), K(input_columns), (routine_info));
++      LOG_INFO("finished to resolve external UDF", K(ret), K(entry_name), K(udf_type), K(file), K(mode), K(input_columns), K(routine_info));
+     } else {
+       ret = OB_ERR_UNEXPECTED;
+       LOG_WARN("unexpected parse_tree of external UDF",
+@@ -1444,12 +1444,11 @@ int ObCreateRoutineResolver::resolve_external_routine_type(const ObString &udf_t
+   }
+ 
+   if (OB_SUCC(ret) && 0 == mode.case_compare(remote_mode)) {
+-    if (OB_FAIL(routine_info.set_is_remote())) {
+-      LOG_WARN("failed to set remote mode", K(ret));
+-    } else if (OB_FAIL(routine_info.set_input_columns(input_columns))) {
++    routine_info.set_is_remote();
++    if (OB_FAIL(routine_info.set_input_columns(input_columns))) {
+       LOG_WARN("failed to set input columns", K(ret), K(input_columns));
+     }
+-  } 
++  }
+ 
+   if (OB_FAIL(ret)) {
+     // do nothing
+diff --git a/src/sql/resolver/ddl/ob_ddl_resolver.cpp b/src/sql/resolver/ddl/ob_ddl_resolver.cpp
+index 432b9ddf32a8..d293cf3659eb 100644
+--- a/src/sql/resolver/ddl/ob_ddl_resolver.cpp
++++ b/src/sql/resolver/ddl/ob_ddl_resolver.cpp
+@@ -3784,7 +3784,6 @@ int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
+                   && column.get_cur_default_value().is_string_type()
+                   && column.get_cur_default_value().get_string().prefix_match_ci("UDF.")) {
+                 column.add_column_flag(GENERATED_COLUMN_UDF_EXPR);
+-                FLOG_INFO("generated column using udf", K(column));
+               }
+             }
+             if (OB_SUCC(ret) && is_pad_char_to_full_length(session_info_->get_sql_mode())) {
+diff --git a/src/sql/resolver/dml/ob_dml_resolver.cpp b/src/sql/resolver/dml/ob_dml_resolver.cpp
+index cd6f2d066227..dcdb65d94b13 100755
+--- a/src/sql/resolver/dml/ob_dml_resolver.cpp
++++ b/src/sql/resolver/dml/ob_dml_resolver.cpp
+@@ -16379,6 +16379,11 @@ int ObDMLResolver::resolve_global_hint(const ParseNode &hint_node,
+       global_hint.force_refresh_lc_ = true;
+       break;
+     }
++    case T_USE_RAY_OFFLOAD: {
++      FLOG_INFO("-- USE_RAY_OFFLOAD hint");
++      global_hint.use_ray_offload_ = true;
++      break;
++    }
+     case T_USE_PLAN_CACHE: {
+       if (1 == hint_node.value_) {
+         global_hint.merge_plan_cache_hint(OB_USE_PLAN_CACHE_NONE);
+diff --git a/src/sql/resolver/dml/ob_hint.cpp b/src/sql/resolver/dml/ob_hint.cpp
+index 858b0f6a61b0..6bf2fd2784a9 100644
+--- a/src/sql/resolver/dml/ob_hint.cpp
++++ b/src/sql/resolver/dml/ob_hint.cpp
+@@ -364,6 +364,7 @@ void ObGlobalHint::reset()
+   max_concurrent_ = UNSET_MAX_CONCURRENT;
+   enable_lock_early_release_ = false;
+   force_refresh_lc_ = false;
++  use_ray_offload_ = false;
+   log_level_.reset();
+   parallel_ = UNSET_PARALLEL;
+   dml_parallel_ = UNSET_PARALLEL;
+@@ -402,6 +403,7 @@ int ObGlobalHint::merge_global_hint(const ObGlobalHint &other)
+   merge_log_level_hint(other.log_level_);
+   enable_lock_early_release_ |= other.enable_lock_early_release_;
+   force_refresh_lc_ |= other.force_refresh_lc_;
++  use_ray_offload_ |= other.use_ray_offload_;
+   merge_plan_cache_hint(other.plan_cache_policy_);
+   merge_parallel_dml_hint(other.pdml_option_);
+   force_trace_log_ |= other.force_trace_log_;
+@@ -517,6 +519,9 @@ int ObGlobalHint::print_global_hint(PlanText &plan_text) const
+       PRINT_GLOBAL_HINT_STR("USE_PLAN_CACHE( DEFAULT )");
+     } else { }
+   }
++  if (OB_SUCC(ret) && use_ray_offload_) { //USE_RAY_OFFLOAD
++    PRINT_GLOBAL_HINT_STR("USE_RAY_OFFLOAD");
++  }
+   if (OB_SUCC(ret) && force_trace_log_) { //TRACE_LOG
+     PRINT_GLOBAL_HINT_STR("TRACE_LOG");
+   }
+diff --git a/src/sql/resolver/dml/ob_hint.h b/src/sql/resolver/dml/ob_hint.h
+index 08bf979cbfcb..2a28c06d5a22 100644
+--- a/src/sql/resolver/dml/ob_hint.h
++++ b/src/sql/resolver/dml/ob_hint.h
+@@ -551,7 +551,8 @@ struct ObGlobalHint {
+                K_(dblink_hints),
+                K_(px_node_hint),
+                K_(disable_op_rich_format_hint),
+-               K_(trigger_hint));
++               K_(trigger_hint),
++               K_(use_ray_offload));
+ 
+   int64_t frozen_version_;
+   int64_t topk_precision_;
+@@ -563,6 +564,7 @@ struct ObGlobalHint {
+   int64_t max_concurrent_;
+   bool enable_lock_early_release_;
+   bool force_refresh_lc_;
++  bool use_ray_offload_;
+   common::ObString log_level_;
+   int64_t parallel_;
+   int64_t dml_parallel_;
+diff --git a/tools/deploy/init.sql b/tools/deploy/init.sql
+index d24abb492100..e11a0056e3d7 100644
+--- a/tools/deploy/init.sql
++++ b/tools/deploy/init.sql
+@@ -92,6 +92,9 @@ call test.set_specify_create_tenant();
+ alter system set ob_compaction_schedule_interval = '10s' tenant sys;
+ alter system set ob_compaction_schedule_interval = '10s' tenant all_user;
+ alter system set ob_compaction_schedule_interval = '10s' tenant all_meta;
++alter system set ob_enable_python_udf = true tenant sys;
++alter system set ob_enable_python_udf = true tenant all_user;
++alter system set ob_enable_python_udf = true tenant all_meta;
+ alter system set merger_check_interval = '10s' tenant sys;
+ alter system set merger_check_interval = '10s' tenant all_user;
+ alter system set merger_check_interval = '10s' tenant all_meta;
+-- 
+2.17.0
+
