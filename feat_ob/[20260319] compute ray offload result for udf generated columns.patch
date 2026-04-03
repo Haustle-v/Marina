@@ -1,0 +1,592 @@
+From 2f1c98d345455728462c184d5bb323ee8fe87138 Mon Sep 17 00:00:00 2001
+From: He Su <yefengshuo.yfs@oceanbase.com>
+Date: Thu, 19 Mar 2026 20:07:59 +0800
+Subject: [PATCH 6/7] [backfill()][ObTableScanOp]
+ compute_ray_offload_result_for_udf_gen_col
+
+---
+ src/sql/engine/table/ob_table_scan_op.cpp | 499 ++++++++++++++++++++++
+ 1 file changed, 499 insertions(+)
+
+diff --git a/src/sql/engine/table/ob_table_scan_op.cpp b/src/sql/engine/table/ob_table_scan_op.cpp
+index ae12bd99e1bb..7466386e8d38 100644
+--- a/src/sql/engine/table/ob_table_scan_op.cpp
++++ b/src/sql/engine/table/ob_table_scan_op.cpp
+@@ -19,8 +19,14 @@
+ #include "share/ob_ddl_checksum.h"
+ #include "observer/omt/ob_tenant_srs.h"
+ #include "share/external_table/ob_external_table_utils.h"
++#include "share/schema/ob_routine_info.h"
++#include "share/schema/ob_table_schema.h"
+ #include "sql/das/iter/ob_das_iter_utils.h"
++#include "sql/engine/expr/ob_expr_lob_utils.h"
+ #include "share/index_usage/ob_index_usage_info_mgr.h"
++#include <pybind11/embed.h>
++#include <pybind11/numpy.h>
++#include <Python.h>
+ 
+ namespace oceanbase
+ {
+@@ -655,6 +661,7 @@ ObTableScanSpec::ObTableScanSpec(ObIAllocator &alloc, const ObPhyOperatorType ty
+     pruned_index_name_(alloc),
+     unstable_index_name_(alloc),
+     ddl_output_cids_(alloc),
++    updated_udf_generated_col_id_(OB_INVALID_ID),
+     tsc_ctdef_(alloc),
+     pdml_partition_id_(NULL),
+     agent_vt_meta_(alloc),
+@@ -690,6 +697,7 @@ OB_SERIALIZE_MEMBER((ObTableScanSpec, ObOpSpec),
+                     pdml_partition_id_,
+                     agent_vt_meta_,
+                     ddl_output_cids_,
++                    updated_udf_generated_col_id_,
+                     tenant_id_col_idx_,
+                     partition_id_calc_type_,
+                     parser_name_,
+@@ -717,10 +725,12 @@ DEF_TO_STRING(ObTableScanSpec)
+        K(gi_above_),
+        K(batch_scan_flag_),
+        K(use_dist_das_),
++       K(use_ray_offload_),
+        K(tsc_ctdef_),
+        K(report_col_checksum_),
+        K_(agent_vt_meta),
+        K_(ddl_output_cids),
++       K_(updated_udf_generated_col_id),
+        K_(tenant_id_col_idx),
+        K_(parser_name),
+        K_(parser_properties),
+@@ -903,6 +913,9 @@ ObTableScanOp::ObTableScanOp(ObExecContext &exec_ctx, const ObOpSpec &spec, ObOp
+     das_tasks_key_(),
+     tsc_monitor_info_(),
+     need_check_outrow_lob_(false),
++    ray_offload_meta_inited_(false),
++    input_column_idxs_in_storage_output_(),
++    ray_offload_serialization_payload_(),
+     rand_scan_processor_()
+ {
+ }
+@@ -1936,6 +1949,9 @@ int ObTableScanOp::set_need_check_outrow_lob()
+ int ObTableScanOp::inner_open()
+ {
+   int ret = OB_SUCCESS;
++  ray_offload_meta_inited_ = false;
++  input_column_idxs_in_storage_output_.reset();
++  ray_offload_serialization_payload_.reset();
+   DASTableLocList &table_locs = ctx_.get_das_ctx().get_table_loc_list();
+   ObSQLSessionInfo *my_session = NULL;
+   uint64_t timestamp = ObTimeUtility::current_time();
+@@ -2130,6 +2146,9 @@ void ObTableScanOp::destroy()
+   scan_iter_ = nullptr;
+   domain_index_.~ObDomainIndexCache();
+   das_tasks_key_.reset();
++  ray_offload_meta_inited_ = false;
++  input_column_idxs_in_storage_output_.reset();
++  ray_offload_serialization_payload_.reset();
+   rand_scan_processor_.reset();
+ }
+ 
+@@ -2244,6 +2263,9 @@ int ObTableScanOp::inner_rescan()
+ int ObTableScanOp::inner_rescan_for_tsc()
+ {
+   int ret = OB_SUCCESS;
++  ray_offload_meta_inited_ = false;
++  input_column_idxs_in_storage_output_.reset();
++  ray_offload_serialization_payload_.reset();
+   input_row_cnt_ = 0;
+   output_row_cnt_ = 0;
+   iter_end_ = false;
+@@ -2942,6 +2964,10 @@ int ObTableScanOp::inner_get_next_batch_for_tsc(const int64_t max_row_cnt)
+       LOG_WARN("add ddl column checksum failed", K(ret));
+     } else if (OB_FAIL(check_has_invalid_outrow_lob(true/*is_batch*/))) {
+       LOG_WARN("fail to check whether has outrow lob column", K(ret));
++    } else if (MY_SPEC.use_ray_offload_
++               && OB_INVALID_ID != MY_SPEC.updated_udf_generated_col_id_
++               && OB_FAIL(compute_ray_offload_result_for_udf_gen_col())) {
++      LOG_WARN("compute_ray_offload_result_for_udf_gen_col failed", K(ret));
+     }
+   }
+ 
+@@ -3623,6 +3649,479 @@ int ObTableScanOp::check_has_invalid_outrow_lob(const bool is_batch)
+ }
+ #undef CHECK_DATUM_OUTROW
+ 
++int ObTableScanOp::get_udf_routine_info(const ObTableSchema *&table_schema,
++                                                const ObRoutineInfo *&routine_info)
++{
++  int ret = OB_SUCCESS;
++  table_schema = nullptr;
++  routine_info = nullptr;
++  ObSqlCtx *sql_ctx = nullptr;
++  ObSchemaGetterGuard *schema_guard = nullptr;
++  const ObColumnSchemaV2 *gen_col_schema = nullptr;
++  uint64_t routine_id = OB_INVALID_ID;
++  if (OB_UNLIKELY(OB_INVALID_ID == MY_SPEC.updated_udf_generated_col_id_)) {
++    ret = OB_ERR_UNEXPECTED;
++    LOG_WARN("updated udf generated column id is invalid", K(ret), K(MY_SPEC.updated_udf_generated_col_id_));
++  } else if (OB_ISNULL(sql_ctx = ctx_.get_sql_ctx()) || OB_ISNULL(schema_guard = sql_ctx->schema_guard_)) {
++    ret = OB_ERR_UNEXPECTED;
++    LOG_WARN("sql ctx or schema guard is null", K(ret), KP(sql_ctx));
++  } else if (OB_FAIL(schema_guard->get_table_schema(MTL_ID(), MY_SPEC.ref_table_id_, table_schema))) {
++    LOG_WARN("get table schema failed", K(ret), K(MY_SPEC.ref_table_id_));
++  } else if (OB_ISNULL(table_schema)) {
++    ret = OB_ERR_UNEXPECTED;
++    LOG_WARN("table schema is null", K(ret), K(MY_SPEC.ref_table_id_));
++  } else if (OB_ISNULL(gen_col_schema = table_schema->get_column_schema(MY_SPEC.updated_udf_generated_col_id_))) {
++    ret = OB_ERR_BAD_FIELD_ERROR;
++    LOG_WARN("updated udf generated column schema not found", K(ret), K(MY_SPEC.updated_udf_generated_col_id_));
++  } else if (!gen_col_schema->is_generated_column_using_udf()) {
++    ret = OB_ERR_UNEXPECTED;
++    LOG_WARN("target column is not udf generated column", K(ret), K(MY_SPEC.updated_udf_generated_col_id_));
++  } else if (OB_UNLIKELY(OB_INVALID_ID == (routine_id = gen_col_schema->get_routine_id()))) {
++    ret = OB_ERR_UNEXPECTED;
++    LOG_WARN("routine id in udf generated column is invalid", K(ret), KPC(gen_col_schema));
++  } else if (OB_FAIL(schema_guard->get_routine_info(MTL_ID(), routine_id, routine_info))) {
++    LOG_WARN("get routine info failed", K(ret), K(routine_id));
++  } else if (OB_ISNULL(routine_info)) {
++    ret = OB_ERR_UNEXPECTED;
++    LOG_WARN("routine info is null", K(ret), K(routine_id));
++  }
++  return ret;
++}
++
++int ObTableScanOp::resolve_input_column_ids(const ObTableSchema &table_schema,
++                                            const ObString &input_columns,
++                                            ObSEArray<uint64_t, 4> &input_column_ids)
++{
++  int ret = OB_SUCCESS;
++  input_column_ids.reset();
++  if (OB_UNLIKELY(input_columns.empty())) {
++    ret = OB_ERR_UNEXPECTED;
++    LOG_WARN("routine input columns is empty", K(ret));
++  } else {
++    const char *ptr = input_columns.ptr();
++    const int64_t len = input_columns.length();
++    int64_t start = 0;
++    while (OB_SUCC(ret) && start < len) {
++      int64_t end = start;
++      while (end < len && ptr[end] != ',') {
++        ++end;
++      }
++      ObString col_name(static_cast<int32_t>(end - start), ptr + start);
++      col_name = col_name.trim();
++      if (OB_UNLIKELY(col_name.empty())) {
++        ret = OB_ERR_BAD_FIELD_ERROR;
++        LOG_WARN("empty column name in routine input columns", K(ret), K(input_columns));
++      } else {
++        const ObColumnSchemaV2 *col_schema = table_schema.get_column_schema(col_name);
++        if (OB_ISNULL(col_schema)) {
++          ret = OB_ERR_BAD_FIELD_ERROR;
++          LOG_WARN("input column not found in table schema", K(ret), K(col_name), K(input_columns));
++        } else if (OB_FAIL(input_column_ids.push_back(col_schema->get_column_id()))) {
++          LOG_WARN("push back input column id failed", K(ret), K(col_name), K(col_schema->get_column_id()));
++        }
++      }
++      start = end + 1;
++    }
++  }
++  return ret;
++}
++
++int ObTableScanOp::get_input_column_idxs_in_storage_output_(const UIntFixedArray &output_cids)
++{
++  int ret = OB_SUCCESS;
++  const ObTableSchema *table_schema = nullptr;
++  const ObRoutineInfo *routine_info = nullptr;
++  ObSEArray<uint64_t, 4> input_column_ids;
++  if (!ray_offload_meta_inited_) {
++    input_column_idxs_in_storage_output_.reset();
++    ray_offload_serialization_payload_.reset();
++    if (OB_FAIL(get_udf_routine_info(table_schema, routine_info))) {
++      FLOG_WARN("failed to get updated udf routine info", K(ret), K(MY_SPEC.updated_udf_generated_col_id_));
++    } else if (OB_FAIL(resolve_input_column_ids(*table_schema, routine_info->get_input_columns(), input_column_ids))) {
++      FLOG_WARN("failed to resolve input column ids from routine input columns",
++               K(ret), K(routine_info->get_input_columns()));
++    } else if (OB_UNLIKELY(input_column_ids.count() <= 0)) {
++      ret = OB_NOT_SUPPORTED;
++      FLOG_WARN("input column ids for ray offload udf generated column is empty",
++               K(ret), K(input_column_ids), K(routine_info->get_input_columns()));
++    } else {
++      for (int64_t m = 0; OB_SUCC(ret) && m < input_column_ids.count(); ++m) {
++        const uint64_t input_col_id = input_column_ids.at(m);
++        int64_t idx_in_storage_output = common::OB_INVALID_ID;
++        for (int64_t k = 0; k < output_cids.count(); ++k) {
++          if (output_cids.at(k) == input_col_id) {
++            idx_in_storage_output = k;
++            break;
++          }
++        }
++        if (OB_UNLIKELY(common::OB_INVALID_ID == idx_in_storage_output)) {
++          ret = OB_ERR_UNEXPECTED;
++          FLOG_WARN("input column id does not exist in storage output",
++                   K(ret), K(input_col_id), K(output_cids));
++        } else if (OB_FAIL(input_column_idxs_in_storage_output_.push_back(idx_in_storage_output))) {
++          FLOG_WARN("failed to save input column idx in storage output", K(ret), K(idx_in_storage_output));
++        }
++      }
++      if (OB_SUCC(ret)) {
++        ObIAllocator &alloc = OB_NOT_NULL(table_rescan_allocator_) ?
++                              static_cast<ObIAllocator &>(*table_rescan_allocator_) :
++                              static_cast<ObIAllocator &>(ctx_.get_allocator());
++        if (OB_FAIL(ob_write_string(alloc,
++                                    routine_info->get_serialization_payload(),
++                                    ray_offload_serialization_payload_))) {
++          FLOG_WARN("failed to copy serialization payload", K(ret));
++        }
++      }
++      if (OB_SUCC(ret)) {
++        ray_offload_meta_inited_ = true;
++      }
++    }
++  }
++  return ret;
++}
++
++int ObTableScanOp::offload_to_ray(const ExprFixedArray &storage_output,
++                                       common::ObObjType result_type,
++                                       ObDatumVector &result_datum_vector,
++                                       const int64_t batch_size,
++                                       const ObBitVector *skip)
++{
++  namespace py = pybind11;
++  // 其中支持的类型与Marina一致：marina/src/pyseekdb/client/db.py#def _arrow_type_to_sql_type(field: pa.Field) -> str:
++  int ret = OB_SUCCESS;
++  // 收集本批中未 skip 的行下标
++  ObSEArray<int64_t, 256> valid_indices;
++  for (int64_t j = 0; j < batch_size; ++j) {
++    if (OB_ISNULL(skip) || !skip->at(j)) {
++      if (OB_FAIL(valid_indices.push_back(j))) {
++        LOG_WARN("push back valid index failed", K(ret), K(j));
++        break;
++      }
++    }
++  }
++
++  const int64_t valid_count = valid_indices.count();
++  if (OB_FAIL(ret) || 0 == valid_count) {
++    return ret;
++  }
++
++  if (OB_UNLIKELY(ray_offload_serialization_payload_.empty())) {
++    ret = OB_ERR_UNEXPECTED;
++    LOG_WARN("ray offload serialization payload is empty", K(ret));
++    return ret;
++  }
++  // Declare gil first so it is destroyed last; ray's destructor must run while GIL is still held.
++  py::gil_scoped_acquire gil;
++  bool ray_is_initialized_ = false;
++  bool ray_is_shutdown_ = false;
++  py::module_ ray;
++  try {
++    py::bytes serialized_udf(ray_offload_serialization_payload_.ptr(),
++                                    static_cast<size_t>(ray_offload_serialization_payload_.length()));
++    py::module_ cloudpickle = py::module_::import("cloudpickle");
++    py::object udf_func = cloudpickle.attr("loads")(serialized_udf);
++
++    // 按输入列实际类型构建 pybind11 array，长度为 valid_count
++    py::tuple args(input_column_idxs_in_storage_output_.count());
++    for (int64_t t = 0; OB_SUCC(ret) && t < input_column_idxs_in_storage_output_.count(); ++t) {
++      const int64_t idx = input_column_idxs_in_storage_output_.at(t);
++      ObExpr *input_expr = storage_output[idx];
++      if (OB_ISNULL(input_expr)) {
++        ret = OB_ERR_UNEXPECTED;
++        LOG_WARN("input expr is null", K(ret), K(idx));
++        break;
++      }
++      ObDatumVector input_datum_vector = input_expr->locate_expr_datumvector(eval_ctx_);
++      const ObObjType input_type = input_expr->obj_meta_.get_type();
++      py::object col_array_obj;
++      switch (input_type) {
++        case ObTinyIntType:  // BOOLEAN
++        case ObIntType: {    // BIGINT
++          py::array_t<int64_t> col_array(static_cast<size_t>(valid_count));
++          int64_t *col_data = col_array.mutable_data();
++          for (int64_t k = 0; k < valid_count; ++k) {
++            const int64_t row_idx = valid_indices.at(k);
++            ObDatum *input_datum = input_datum_vector.at(row_idx);
++            if (OB_ISNULL(input_datum)) {
++              ret = OB_ERR_UNEXPECTED;
++              LOG_WARN("input datum is null", K(ret), K(idx), K(row_idx));
++              break;
++            }
++            col_data[k] = input_expr->obj_meta_.is_unsigned()
++                ? static_cast<int64_t>(input_datum->get_uint64())
++                : input_datum->get_int();
++          }
++          col_array_obj = std::move(col_array);
++          break;
++        }
++        case ObDoubleType: {  // DOUBLE
++          py::array_t<double> col_array(static_cast<size_t>(valid_count));
++          double *col_data = col_array.mutable_data();
++          for (int64_t k = 0; k < valid_count; ++k) {
++            const int64_t row_idx = valid_indices.at(k);
++            ObDatum *input_datum = input_datum_vector.at(row_idx);
++            if (OB_ISNULL(input_datum)) {
++              ret = OB_ERR_UNEXPECTED;
++              LOG_WARN("input datum is null", K(ret), K(idx), K(row_idx));
++              break;
++            }
++            col_data[k] = input_datum->get_double();
++          }
++          col_array_obj = std::move(col_array);
++          break;
++        }
++        case ObTextType:      // TEXT
++        case ObLongTextType: { // LONGTEXT (and LONGBLOB when cs_type is binary)
++          // TEXT / LONGTEXT / BLOB: use read_real_string_data, then str vs bytes by ob_is_blob
++          // 使用 import("numpy") 建 ndarray(dtype=object)，与 int/double 列统一为 ndarray
++          py::module_ np = py::module_::import("numpy");
++          py::object col_array = np.attr("empty")(valid_count, py::arg("dtype") = py::str("object"));
++          ObIAllocator &alloc = get_exec_ctx().get_allocator();
++          const bool has_lob_header = input_expr->obj_meta_.has_lob_header();
++          const ObCollationType cs_type = input_expr->datum_meta_.cs_type_;
++          for (int64_t k = 0; OB_SUCC(ret) && k < valid_count; ++k) {
++            const int64_t row_idx = valid_indices.at(k);
++            ObDatum *input_datum = input_datum_vector.at(row_idx);
++            if (OB_ISNULL(input_datum)) {
++              ret = OB_ERR_UNEXPECTED;
++              LOG_WARN("input datum is null", K(ret), K(idx), K(row_idx));
++              break;
++            }
++            py::object item;
++            if (input_datum->is_null()) {
++              item = py::none();
++            } else {
++              ObString s;
++              if (OB_FAIL(ObTextStringHelper::read_real_string_data(alloc, *input_datum,
++                      input_expr->datum_meta_, has_lob_header, s, &get_exec_ctx()))) {
++                LOG_WARN("read_real_string_data failed", K(ret), K(idx), K(row_idx));
++                break;
++              }
++              if (s.empty()) {
++                if (ob_is_blob(input_type, cs_type)) {
++                  item = py::bytes("", 0);
++                } else {
++                  item = py::str("");
++                }
++              } else {
++                if (ob_is_blob(input_type, cs_type)) {
++                  item = py::bytes(s.ptr(), s.length());
++                } else {
++                  item = py::str(std::string(s.ptr(), s.length()));
++                }
++              }
++            }
++            if (OB_SUCC(ret)) {
++              col_array[py::cast(static_cast<size_t>(k))] = item;
++            }
++          }
++          col_array_obj = std::move(col_array);
++          break;
++        }
++        default:
++          ret = OB_NOT_SUPPORTED;
++          LOG_WARN("ray offload input column type not supported, only BOOLEAN/BIGINT/DOUBLE/TEXT/LONGTEXT/BLOB supported for now", K(ret), "type", input_type);
++      }
++      if (OB_FAIL(ret)) {
++        break;
++      }
++      args[static_cast<size_t>(t)] = col_array_obj;
++    }
++    
++    if (OB_SUCC(ret)) {
++      const int64_t ray_import_init_start_ms = ObTimeUtility::current_time_ms();
++      ray = py::module_::import("ray");
++      ray_is_initialized_ = true;
++      // ray.attr("init")(py::arg("address") = "ray://6.12.235.70:10001");
++      const int64_t ray_import_init_elapsed_ms = ObTimeUtility::current_time_ms() - ray_import_init_start_ms;
++      FLOG_INFO("-- Time: ray import and init elapsed (ms)", K(ray_import_init_elapsed_ms));
++      const int64_t t1 = ObTimeUtility::current_time_ms();
++      py::object remote_func = ray.attr("remote")(udf_func);
++      const int64_t t2 = ObTimeUtility::current_time_ms();
++      py::object object_ref = remote_func.attr("remote")(*args);
++      const int64_t t3 = ObTimeUtility::current_time_ms();
++      py::object result = ray.attr("get")(object_ref);
++      const int64_t t4 = ObTimeUtility::current_time_ms();
++      ray.attr("shutdown")();   // 必须要关
++      const int64_t t5 = ObTimeUtility::current_time_ms();
++      FLOG_INFO("-- Time: ray remote, object_ref, get elapsed (ms), shutdown elapsed (ms)", K(t2 - t1), K(t3 - t2), K(t4 - t3), K(t5 - t4));
++      ray_is_shutdown_ = true;
++      const int64_t ray_batch_total_elapsed_ms = ObTimeUtility::current_time_ms() - ray_import_init_start_ms;
++      FLOG_INFO("-- Time: ray batch total elapsed (ms)", K(ray_batch_total_elapsed_ms));
++
++      // 按 UDF 生成列（伪列）实际类型解析返回值并写回
++      size_t result_len = 0;
++      bool result_len_ok = false;
++      switch (result_type) {
++        case ObTinyIntType:  // BOOLEAN
++        case ObIntType: {    // BIGINT
++          py::array_t<int64_t> result_arr = result.cast<py::array_t<int64_t>>();
++          result_len = static_cast<size_t>(result_arr.size());
++          result_len_ok = (result_len == static_cast<size_t>(valid_count));
++          if (result_len_ok) {
++            const int64_t *result_data = result_arr.data();
++            for (size_t k = 0; k < result_len; ++k) {
++              const int64_t row_idx = valid_indices.at(static_cast<int64_t>(k));
++              result_datum_vector.at(row_idx)->set_int(result_data[k]);
++            }
++          }
++          break;
++        }
++        case ObDoubleType: {  // DOUBLE
++          py::array_t<double> result_arr = result.cast<py::array_t<double>>();
++          result_len = static_cast<size_t>(result_arr.size());
++          result_len_ok = (result_len == static_cast<size_t>(valid_count));
++          if (result_len_ok) {
++            const double *result_data = result_arr.data();
++            for (size_t k = 0; k < result_len; ++k) {
++              const int64_t row_idx = valid_indices.at(static_cast<int64_t>(k));
++              result_datum_vector.at(row_idx)->set_double(result_data[k]);
++            }
++          }
++          break;
++        }
++        case ObTextType:      // TEXT
++        case ObLongTextType: { // LONGTEXT / LONGBLOB
++          // 结果按 ndarray(dtype=object) 解析，与输入列类型一致
++          py::array result_arr = result.cast<py::array>();
++          result_len = static_cast<size_t>(result_arr.size());
++          // py::list result_list = result.cast<py::list>();
++          // result_len = static_cast<size_t>(result_list.size());
++          result_len_ok = (result_len == static_cast<size_t>(valid_count));
++          if (result_len_ok) {
++            ObIAllocator &alloc = get_exec_ctx().get_allocator();
++            for (size_t k = 0; OB_SUCC(ret) && k < result_len; ++k) {
++              const int64_t row_idx = valid_indices.at(static_cast<int64_t>(k));
++              ObDatum *datum = result_datum_vector.at(row_idx);
++              py::object item = result_arr[py::cast(static_cast<size_t>(k))];
++              // py::object item = result_list[static_cast<py::size_t>(k)];  // 原 list 方式
++              if (item.is_none()) {
++                datum->set_null();
++              } else {
++                ObString content;
++                if (py::isinstance<py::bytes>(item)) {
++                  py::bytes b = item.cast<py::bytes>();
++                  const char *ptr = static_cast<const char *>(PyBytes_AS_STRING(b.ptr()));
++                  const Py_ssize_t py_len = PyBytes_GET_SIZE(b.ptr());
++                  if (py_len > static_cast<Py_ssize_t>(INT32_MAX)) {
++                    ret = OB_SIZE_OVERFLOW;
++                    LOG_WARN("ray offload result bytes length overflow", K(ret), K(k), K(py_len));
++                  } else {
++                    content.assign_ptr(ptr, static_cast<int32_t>(py_len));
++                    if (OB_FAIL(ObTextStringHelper::string_to_templob_result(result_type, true, alloc, content, *datum))) {
++                      LOG_WARN("string_to_templob_result failed for bytes", K(ret), K(k));
++                    }
++                  }
++                } else {
++                  std::string s = item.cast<std::string>();
++                  if (s.length() > static_cast<size_t>(INT32_MAX)) {
++                    ret = OB_SIZE_OVERFLOW;
++                    LOG_WARN("ray offload result string length overflow", K(ret), K(k));
++                  } else {
++                    content.assign_ptr(s.data(), static_cast<int32_t>(s.length()));
++                    if (OB_FAIL(ObTextStringHelper::string_to_templob_result(result_type, true, alloc, content, *datum))) {
++                      LOG_WARN("string_to_templob_result failed", K(ret), K(k));
++                    }
++                  }
++                }
++              }
++            }
++          }
++          break;
++        }
++        default:
++          ret = OB_NOT_SUPPORTED;
++          LOG_WARN("ray offload UDF generated column type not supported, only BIGINT/BOOLEAN/DOUBLE/TEXT/LONGTEXT/BLOB supported for now",
++                   K(ret), "type", result_type);
++      }
++      if (OB_SUCC(ret) && !result_len_ok) {
++        ret = OB_ERR_UNEXPECTED;
++        LOG_WARN("ray offload result length mismatch", K(ret), K(result_len), K(valid_count));
++      }
++    }
++  } catch (const py::error_already_set &e) {
++    ret = OB_ERR_UNEXPECTED;
++    if (ray_is_initialized_ && !ray_is_shutdown_) {
++      ray.attr("shutdown")();
++    }
++    LOG_WARN("python error when evaluating ray offload udf batch", K(ret), "python_err", e.what());
++  } catch (const std::exception &e) {
++    ret = OB_ERR_UNEXPECTED;
++    if (ray_is_initialized_ && !ray_is_shutdown_) {
++      ray.attr("shutdown")();
++    }
++    LOG_WARN("cpp error when evaluating ray offload udf batch", K(ret), "cpp_err", e.what());
++  }
++  return ret;
++}
++
++int ObTableScanOp::compute_ray_offload_result_for_udf_gen_col()
++{
++  int ret = OB_SUCCESS;
++  const ExprFixedArray &storage_output = MY_CTDEF.get_das_output_exprs();
++  const UIntFixedArray &output_cids = MY_CTDEF.get_das_output_cids();
++  if (OB_UNLIKELY(storage_output.count() != output_cids.count())) {
++    ret = OB_NOT_SUPPORTED;
++    LOG_WARN("storage_output and output_cids count mismatch, may be caused by attach path in the RAY OFFLOAD",
++             K(storage_output.count()), K(output_cids.count()), KP(MY_CTDEF.attach_spec_.attach_ctdef_));
++  }
++
++  if (OB_FAIL(ret)) {
++  } else if (OB_FAIL(get_input_column_idxs_in_storage_output_(output_cids))) {
++    LOG_WARN("failed to get input column idxs in storage output", K(ret), K(MY_SPEC.updated_udf_generated_col_id_));
++  }
++
++  // evaluate the input columns of UDF for current batch
++  if (OB_SUCC(ret)) {
++    for (int64_t n = 0; OB_SUCC(ret) && n < input_column_idxs_in_storage_output_.count(); ++n) {
++      const int64_t idx = input_column_idxs_in_storage_output_.at(n);
++      ObExpr *input_expr = storage_output[idx];
++      if (OB_ISNULL(input_expr)) {
++        ret = OB_ERR_UNEXPECTED;
++        LOG_WARN("input expr is null", K(ret), K(idx));
++      } else if (OB_FAIL(input_expr->eval_batch(eval_ctx_, *brs_.skip_, brs_.size_))) {
++        LOG_WARN("evaluate input expression failed", K(ret), K(idx));
++      }
++    }
++  }
++
++  const int64_t eval_batch_start_ms = ObTimeUtility::current_time_ms();
++  int64_t pseudo_ray_offload_column_idx = -1;
++  for (int64_t i = 0; OB_SUCC(ret) && i < storage_output.count(); ++i) {
++    ObExpr *e = storage_output[i];
++    if (OB_ISNULL(e)) {
++      ret = OB_ERR_UNEXPECTED;
++      LOG_WARN("error unexpected, expr is nullptr", K(ret));
++      break;
++    } else if (T_PSEUDO_RAY_OFFLOAD_COLUMN == e->type_) {
++      pseudo_ray_offload_column_idx = i;
++      break;
++    }
++  }
++  if (OB_SUCC(ret) && pseudo_ray_offload_column_idx >= 0) {
++    ObExpr *e = storage_output[pseudo_ray_offload_column_idx];
++    if (OB_FAIL(e->eval_batch(eval_ctx_, *brs_.skip_, brs_.size_))) {
++      LOG_WARN("evaluate expression failed", K(ret));
++    } else {
++      e->locate_datums_for_update(eval_ctx_, brs_.size_);
++      ObEvalInfo &info = e->get_eval_info(eval_ctx_);
++      info.point_to_frame_ = true;
++      ObDatumVector datum_vector = e->locate_expr_datumvector(eval_ctx_);
++      // 按批卸载
++      if (brs_.size_ > 0) {
++        if (OB_FAIL(offload_to_ray(storage_output, e->obj_meta_.get_type(), datum_vector, brs_.size_, brs_.skip_))) {
++          LOG_WARN("failed to compute ray offload result for batch", K(ret));
++        }
++      }
++      e->set_evaluated_projected(eval_ctx_);
++    }
++  }
++  const int64_t eval_batch_elapsed_ms = ObTimeUtility::current_time_ms() - eval_batch_start_ms;
++  FLOG_INFO("-- Time: eval_batch elapsed (ms)", K(eval_batch_elapsed_ms), K(lbt()));
++
++  return ret;
++}
++
+ int ObTableScanOp::report_ddl_column_checksum()
+ {
+   int ret = OB_SUCCESS;
+-- 
+2.17.0
+
