@@ -16,11 +16,7 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
-import json
-import uuid
-import time
 import cloudpickle
-import shutil
 
 from . import Client, AdminClient, HNSWConfiguration
 from .collection import Collection
@@ -100,6 +96,7 @@ def _ensure_ray_initialized(
 
 def _arrow_type_to_sql_type(field: pa.Field) -> str:
     """Map PyArrow type to SQL type for CREATE TABLE."""
+    """ If any new type is added here, please also add it to the ObTableScanOp::offload_to_ray in ob_table_scan_op.cpp. """
     typ = field.type
     if pa.types.is_string(typ):
         return "TEXT"
@@ -112,7 +109,7 @@ def _arrow_type_to_sql_type(field: pa.Field) -> str:
     elif pa.types.is_boolean(typ):
         return "BOOLEAN"
     elif pa.types.is_binary(typ) or pa.types.is_large_binary(typ):
-        return "BLOB"
+        return "LONGBLOB"   # 512MB in OB
     elif pa.types.is_list(typ) or pa.types.is_large_list(typ) or isinstance(typ, pa.FixedSizeListType):
         # Handle vectors: assume float list is vector if it has fixed size or name implies it
         # For now, simplistic check: if it's a fixed size list of floats, treat as VECTOR
@@ -424,14 +421,17 @@ class Table:
                     vals.append("NULL")
                 elif isinstance(val, (int, float)):
                     vals.append(str(val))
+                elif isinstance(val, bool):
+                    vals.append("1" if val else "0")
+                elif isinstance(val, bytes):
+                    vals.append(f"X'{val.hex()}'")
                 elif isinstance(val, (list, np.ndarray)):
                     # Vector or list -> string representation
                     if isinstance(val, np.ndarray):
                         val = val.tolist()
-                    vals.append(f"'{str(val)}'")
+                    vals.append(_sql_quote_string(str(val)))
                 else:
-                    safe_val = str(val).replace("'", "''")
-                    vals.append(f"'{safe_val}'")
+                    vals.append(_sql_quote_string(str(val)))
             values_list.append(f"({', '.join(vals)})")
             
         # Bulk insert
@@ -577,11 +577,15 @@ class Table:
                 ");"
             )
             _LOG.info("Creating UDF with SQL: %s; source file: %s", create_udf_func_sql, file_path)
+
+            # Best-effort cleanup for existing same-name UDF before CREATE.
+            drop_udf_if_exist_sql = f"DROP FUNCTION IF EXISTS {udf_name};"
+            self._conn._client_proxy._server._execute(drop_udf_if_exist_sql)
+
             # execute the sql to create the udf function
             self._conn._client_proxy._server._execute(create_udf_func_sql)
 
-            col_def += f" GENERATED ALWAYS AS (UDF.{udf_name})"
-            col_def += " STORED"                # OB will not allocate physical memory for the VITRUAL generated columns, so only STORED is supported
+            col_def += f" AS UDF {udf_name}"
 
         else:
             # Normal columns
@@ -623,6 +627,20 @@ class Table:
         except Exception:
             # Schema cache is optional; ignore failures
             pass
+
+    def backfill(self, col_name: str, num_gpus: int = 0, num_batches: int = 1) -> None:
+        ray_offload_hint = "/*+ USE_RAY_OFFLOAD"
+        if num_gpus != 0:
+            ray_offload_hint += f" USE_RAY_OFFLOAD_NUM_GPUS({num_gpus})"
+        if num_batches != 0:
+            ray_offload_hint += f" USE_RAY_OFFLOAD_NUM_BATCHES({num_batches})"
+        ray_offload_hint += f" QUERY_TIMEOUT(1000000000)*/"
+
+        backfill_sql = (
+            f"UPDATE {ray_offload_hint} {self._name} SET {col_name} = NULL;"
+        )
+        _LOG.info("Backfill with SQL: %s", backfill_sql)
+        self._conn._client_proxy._server._execute(backfill_sql)
 
     def delete(self, where: str) -> None:
         """Delete rows based on filter."""
@@ -680,305 +698,6 @@ class Table:
         _LOG.info("Updating rows with SQL: %s", sql)
         self._conn._client_proxy._server._execute(sql)
 
-    def backfill_async(
-        self,
-        col_name: str,
-        *,
-        udf: Any = None,
-        where: Optional[str] = None,
-        ray_address: Optional[str] = None,
-        ray_init_kwargs: Optional[Dict[str, Any]] = None,
-        _enable_job_tracker_saves: bool = True,
-        **kwargs,
-    ) -> Any:
-        """
-        Backfill a column asynchronously (Ray-based), similar to geneva-0.7.0.
-
-        Notes:
-        - Unlike Geneva/Lance, pyseekdb backfill writes results back to an OceanBase
-          relational table via UPDATE statements.
-        - Column must already exist. Use Table.add_column first.
-        - Currently the UDF must be provided explicitly (pyseekdb does not persist
-          UDF specs in table metadata like Geneva does).
-
-        Extra kwargs (best-effort supported):
-        - batch_size: int (default 100)
-        - concurrency: int (default 8)
-        - key_column: str (default "id") used to identify rows for UPDATE
-        - read_columns: list[str] | None (override input columns)
-        """
-        if not col_name or not isinstance(col_name, str):
-            raise ValueError("col_name must be a non-empty string")
-        if udf is None:
-            raise ValueError("udf must be provided for pyseekdb backfill")
-
-        try:
-            import ray  # type: ignore
-        except Exception as e:
-            raise ImportError(
-                "ray is required for backfill_async. Please install it via `pip install ray`."
-            ) from e
-
-        batch_size = int(kwargs.get("batch_size", 100) or 100)
-        concurrency = int(kwargs.get("concurrency", 8) or 8)
-        key_column = str(kwargs.get("key_column", "id"))
-        read_columns = kwargs.get("read_columns", None)
-
-        # Validate column exists (server-side best-effort)
-        try:
-            self._conn._client_proxy._server._execute(f"DESCRIBE `{self._name}`")
-        except Exception as e:
-            raise RuntimeError(f"Failed to describe table `{self._name}`: {e}") from e
-
-        # Determine input columns from UDF
-        try:
-            from pyseekdb.transformer import UDF as SeekUDF  # optional import
-        except Exception:
-            SeekUDF = None  # type: ignore
-
-        udf_obj = udf
-        if SeekUDF is not None and isinstance(udf_obj, SeekUDF):
-            input_cols = udf_obj.input_columns
-        else:
-            # Assume callable; try to access .input_columns if present
-            input_cols = getattr(udf_obj, "input_columns", None)
-
-        if read_columns is not None:
-            input_cols = list(read_columns)
-
-        if input_cols is None:
-            # RecordBatch UDF in Geneva uses full batch; here we must still select columns.
-            raise ValueError(
-                "Unable to infer input columns for UDF. Please pass read_columns=[...]"
-            )
-
-        job_id = uuid.uuid4().hex
-
-        # Initialize/attach Ray if not already running.
-        # If ray_address is provided, attach to that cluster.
-        _ensure_ray_initialized(ray, ray_address, ray_init_kwargs)
-
-        @ray.remote  # type: ignore[misc]
-        def _backfill_batch_task(
-            uri: str,
-            table_name: str,
-            target_col: str,
-            key_col: str,
-            input_cols_task: List[str],
-            udf_bytes: bytes,
-            where_sql: Optional[str],
-            offset: int,
-            limit: int,
-        ) -> int:
-            import cloudpickle
-            import pymysql
-            import pyarrow as pa
-
-            parsed = urlparse(uri)
-            host = parsed.hostname
-            port = parsed.port or 3306
-            user = parsed.username or "root"
-            password = parsed.password or ""
-            database = parsed.path.lstrip("/") if parsed.path and parsed.path != "/" else None
-            params = parse_qs(parsed.query or "")
-            tenant = params.get("tenant", [None])[0]
-
-            udf_local = cloudpickle.loads(udf_bytes)
-
-            # OceanBase/SeekDB tenant is typically encoded as user@tenant for authentication.
-            # Using session variables (e.g. SET @ob_tenant) is not reliable across server setups.
-            full_user = user
-            if tenant and user and "@" not in user:
-                full_user = f"{user}@{tenant}"
-
-            conn = pymysql.connect(
-                host=host,
-                port=port,
-                user=full_user,
-                password=password,
-                database=database,
-                autocommit=True,
-            )
-            try:
-                with conn.cursor() as cur:
-                    # Phase 1: scan ONLY primary key (or key column) for batching.
-                    # This minimizes data transfer and avoids pulling large columns
-                    # (e.g. blobs) just for pagination.
-                    key_sql = f"SELECT `{key_col}` FROM `{table_name}`"
-                    if where_sql:
-                        key_sql += f" WHERE {where_sql}"
-                    key_sql += (
-                        f" ORDER BY `{key_col}` LIMIT {int(limit)} OFFSET {int(offset)}"
-                    )
-                    cur.execute(key_sql)
-                    key_rows = cur.fetchall()
-                    if not key_rows:
-                        return 0
-
-                    keys = [r[0] for r in key_rows]
-
-                    # Phase 2: fetch only the required input columns for these keys.
-                    # Note: we do not rely on ORDER BY here; we will map by key later.
-                    cols = [key_col] + list(input_cols_task)
-                    select_cols_sql = ", ".join([f"`{c}`" for c in cols])
-                    in_list = ", ".join([_sql_literal(k) for k in keys])
-                    sql = (
-                        f"SELECT {select_cols_sql} FROM `{table_name}` "
-                        f"WHERE `{key_col}` IN ({in_list})"
-                    )
-                    cur.execute(sql)
-                    rows = cur.fetchall()
-                    if not rows:
-                        return 0
-
-                    # Normalize rows to dicts
-                    desc = [d[0] for d in cur.description]
-                    dict_rows = [dict(zip(desc, r)) for r in rows]
-
-                    # Build record batch
-                    batch = pa.RecordBatch.from_pylist(dict_rows)
-
-                    # Apply UDF (supports our migrated UDF wrapper and plain callables)
-                    try:
-                        out_arr = udf_local(batch)  # record-batch UDF style
-                    except TypeError:
-                        # Fallback: scalar UDF expecting python values per row
-                        out_vals = []
-                        for r in dict_rows:
-                            args = [r[c] for c in input_cols_task]
-                            out_vals.append(udf_local(*args))
-                        out_arr = pa.array(out_vals)
-
-                    out_vals = out_arr.to_pylist()
-                    keys = [r[key_col] for r in dict_rows]
-
-                    # Build one UPDATE with CASE WHEN to reduce round-trips
-                    case_parts = []
-                    in_parts = []
-                    for k, v in zip(keys, out_vals):
-                        in_parts.append(str(int(k)) if isinstance(k, (int,)) else _sql_literal(k))
-                        if v is None:
-                            v_sql = "NULL"
-                        elif isinstance(v, (dict, list)):
-                            v_sql = _sql_literal(json.dumps(v))
-                        else:
-                            v_sql = _sql_literal(v)
-                        case_parts.append(f"WHEN { _sql_literal(k) } THEN {v_sql}")
-
-                    update_sql = (
-                        f"UPDATE `{table_name}` SET `{target_col}` = CASE `{key_col}` "
-                        + " ".join(case_parts)
-                        + " END WHERE `"
-                        + key_col
-                        + "` IN ("
-                        + ", ".join([_sql_literal(k) for k in keys])
-                        + ")"
-                    )
-                    cur.execute(update_sql)
-                    return len(keys)
-            finally:
-                conn.close()
-
-        # Serialize UDF for workers
-        try:
-            import cloudpickle
-        except Exception as e:
-            raise ImportError("cloudpickle is required for backfill_async") from e
-        udf_payload = cloudpickle.dumps(udf_obj)
-
-        # Total row count
-        count_sql = f"SELECT COUNT(*) AS cnt FROM `{self._name}`"
-        if where:
-            count_sql += f" WHERE {where}"
-        res = self._conn._client_proxy._server._execute(count_sql)
-        if isinstance(res, list) and res:
-            if isinstance(res[0], dict):
-                total = int(list(res[0].values())[0])
-            else:
-                total = int(res[0][0])
-        else:
-            total = 0
-
-        offsets = list(range(0, total, batch_size))
-        # Limit concurrency by submitting all tasks; Ray will schedule accordingly.
-        obj_refs = [
-            _backfill_batch_task.remote(
-                self._conn._uri,
-                self._name,
-                col_name,
-                key_column,
-                list(input_cols),
-                udf_payload,
-                where,
-                off,
-                batch_size,
-            )
-            for off in offsets
-        ]
-
-        class RayJobFuture:
-            def __init__(self, job_id: str, refs: List[Any]) -> None:
-                self.job_id = job_id
-                self._refs = refs
-
-            def done(self, timeout: Optional[float] = None) -> bool:
-                if not self._refs:
-                    return True
-                ready, _ = ray.wait(self._refs, num_returns=len(self._refs), timeout=timeout)
-                return len(ready) == len(self._refs)
-
-            def result(self, timeout: Optional[float] = None) -> Any:
-                # timeout best-effort: if provided, wait then raise
-                if timeout is not None and not self.done(timeout=timeout):
-                    raise TimeoutError("Backfill job not completed within timeout")
-                return ray.get(self._refs)
-
-            def status(self, timeout: Optional[float] = None) -> None:
-                if not self._refs:
-                    print(f"job {self.job_id}: no work")
-                    return
-                ready, _ = ray.wait(self._refs, num_returns=len(self._refs), timeout=0.0)
-                print(f"job {self.job_id}: {len(ready)}/{len(self._refs)} batches done")
-
-        return RayJobFuture(job_id, obj_refs)
-
-    def backfill(
-        self,
-        col_name: str,
-        *,
-        udf: Any = None,
-        where: Optional[str] = None,
-        concurrency: int = 8,
-        intra_applier_concurrency: int = 1,
-        refresh_status_secs: float = 2.0,
-        ray_address: Optional[str] = None,
-        ray_init_kwargs: Optional[Dict[str, Any]] = None,
-        _enable_job_tracker_saves: bool = True,
-        **kwargs,
-    ) -> str:
-        """
-        Backfill a column synchronously (blocking), similar to geneva-0.7.0.
-
-        Returns job_id string.
-        """
-        # Keep signature compatible; intra_applier_concurrency not used in SQL backend yet.
-        fut = self.backfill_async(
-            col_name,
-            udf=udf,
-            where=where,
-            concurrency=concurrency,
-            intra_applier_concurrency=intra_applier_concurrency,
-            ray_address=ray_address,
-            ray_init_kwargs=ray_init_kwargs,
-            _enable_job_tracker_saves=_enable_job_tracker_saves,
-            **kwargs,
-        )
-        while not fut.done(timeout=refresh_status_secs):
-            fut.status()
-            time.sleep(max(0.1, float(refresh_status_secs)))
-        fut.status()
-        fut.result()
-        return fut.job_id
 
 def connect(uri: str, **kwargs) -> Connection:
     return Connection(uri, **kwargs)
